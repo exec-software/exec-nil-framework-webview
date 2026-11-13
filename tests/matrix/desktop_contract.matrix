@@ -210,8 +210,10 @@ main returns number begin paragraph
     expect require-ok of boolean, text with (show-window with surface), "show window"
     evaluate mark with "ready-show"
 
-    value http-operation is require-ok of Operation, text with (navigate with surface, (base plus "/page")), "HTTP navigate"
+    !!! The initial full document includes a fragment that its HTTP request omits.
+    value http-operation is require-ok of Operation, text with (navigate with surface, (base plus "/page#initial")), "HTTP navigate"
     evaluate expect-navigation with surface, http-operation, deadline
+    evaluate expect-json with surface, "return location.hash;", (quote plus "#initial" plus quote), deadline
     evaluate expect-json with surface, "return document.getElementById('marker').textContent;", (quote plus "http-ready-λ" plus quote), deadline
     evaluate mark with "http-document"
 
@@ -223,8 +225,8 @@ main returns number begin paragraph
         ("{" plus quote plus "order" plus quote plus ":" plus quote plus "deferred" plus quote plus "}"),
         (quote plus "scheduled" plus quote), deadline, "deferred"
     evaluate mark with "message-deferred"
-    evaluate expect-provenance with immediate, capabilities, (base plus "/page"), origin
-    evaluate expect-provenance with deferred, capabilities, (base plus "/page"), origin
+    evaluate expect-provenance with immediate, capabilities, (base plus "/page#initial"), origin
+    evaluate expect-provenance with deferred, capabilities, (base plus "/page#initial"), origin
     evaluate mark with "message-provenance"
 
     evaluate expect-json with surface, "return window.nilwebviewFragmentMarker = 71;", "71", deadline

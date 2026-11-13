@@ -241,7 +241,7 @@ struct WinWindow final : Window {
     ComPtr<ICoreWebView2Environment> environment;
     ComPtr<ICoreWebView2Controller> controller;
     ComPtr<ICoreWebView2> view;
-    ComPtr<ICoreWebView2_21> modern;
+    ComPtr<ICoreWebView2_22> modern;
     std::shared_ptr<Profile> profile;
     ComPtr<IUri> requested_uri;
     std::wstring requested_html_uri;
@@ -251,6 +251,7 @@ struct WinWindow final : Window {
     std::int64_t navigation_operation = 0;
     bool bootstrap = true;
     bool admit_request = false;
+    bool admit_document_request = false;
     bool policy_cancelled = false;
     bool fragment_request = false;
 };
@@ -275,6 +276,7 @@ void dispose(const std::shared_ptr<WinWindow> &value) noexcept {
     // Publish retirement first so that callback can drain its private environment.
     if (value->profile) value->profile->retired = true;
     value->admit_request = false;
+    value->admit_document_request = false;
     // All registered handlers capture weak state only. Close releases the
     // controller's handlers; pending completions remain independently safe.
     if (value->view) value->view->Stop();
@@ -444,6 +446,17 @@ bool same_uri(IUri *expected, LPCWSTR text) {
     return parse_native_uri(text, actual) &&
         canonical_uri(expected, requested) && canonical_uri(actual.Get(), observed) && requested == observed;
 }
+bool same_http_request(IUri *expected, LPCWSTR text) {
+    ComPtr<IUri> actual;
+    std::wstring requested, observed;
+    if (!parse_native_uri(text, actual) || !canonical_uri(expected, requested) ||
+        !canonical_uri(actual.Get(), observed)) return false;
+    if (requested.compare(0, 7, L"http://") != 0 && requested.compare(0, 8, L"https://") != 0) return false;
+    // HTTP requests omit the document fragment; paths and queries remain exact.
+    if (const auto fragment = requested.find(L'#'); fragment != std::wstring::npos) requested.erase(fragment);
+    if (const auto fragment = observed.find(L'#'); fragment != std::wstring::npos) observed.erase(fragment);
+    return requested == observed;
+}
 bool fragment_only(IUri *requested, LPCWSTR source, bool &repeat) {
     repeat = false;
     ComPtr<IUri> current;
@@ -468,6 +481,7 @@ void finish_fragment(WinContext &state, const std::shared_ptr<WinWindow> &value,
     }
     const auto operation = value->navigation_operation;
     value->admit_request = false; value->fragment_request = false;
+    value->admit_document_request = false;
     value->navigation_operation = 0;
     state.navigation_finished(value, operation, true, url, "");
 }
@@ -475,7 +489,53 @@ bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shar
     const std::weak_ptr<WinContext> weak_context = context;
     const std::weak_ptr<WinWindow> weak_window = window;
     EventRegistrationToken token{};
-    HRESULT result = window->view->add_NavigationStarting(Callback<ICoreWebView2NavigationStartingEventHandler>(
+    // NavigationStarting cancellation preserves the current document, but
+    // WebView2 may already send its GET while that callback is running. Gate
+    // document requests separately before network access. Subresources keep
+    // their normal browser behavior; this is not a general network sandbox.
+    ComPtr<ICoreWebView2WebResourceResponse> denied_response;
+    if (FAILED(window->environment->CreateWebResourceResponse(nullptr, 403, L"Forbidden",
+        L"Content-Type: text/plain\r\nContent-Length: 0\r\nCache-Control: no-store\r\n", &denied_response)) || !denied_response ||
+        FAILED(window->modern->AddWebResourceRequestedFilterWithRequestSourceKinds(L"*",
+            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT, COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL))) return false;
+    HRESULT result = window->view->add_WebResourceRequested(Callback<ICoreWebView2WebResourceRequestedEventHandler>(
+        [weak_context, weak_window, denied_response](ICoreWebView2 *sender, ICoreWebView2WebResourceRequestedEventArgs *args) -> HRESULT {
+            if (!args) return E_POINTER;
+            bool allowed = false;
+            callback(weak_context, weak_window, [&](auto &state, const auto &value) {
+                if (state.fatal() || value->failed || value->bootstrap || !value->ready) return;
+                ComPtr<ICoreWebView2WebResourceRequest> request;
+                COREWEBVIEW2_WEB_RESOURCE_CONTEXT resource = COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL;
+                WideText uri, method;
+                if (FAILED(args->get_ResourceContext(&resource)) || resource != COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT ||
+                    FAILED(args->get_Request(&request)) || !request || FAILED(request->get_Uri(&uri.value)) ||
+                    FAILED(request->get_Method(&method.value)) || !uri.value || !method.value) {
+                    state.provider_failed(value, "WebView2 document request metadata unavailable"); return;
+                }
+                if (value->admit_document_request && !value->policy_cancelled &&
+                    value->navigation_operation > 0 && value->operation_kind == Operation::navigation &&
+                    value->operation == value->navigation_operation && !wcsncmp(method.value, L"GET", 4) &&
+                    same_http_request(value->requested_uri.Get(), uri.value)) {
+                    // Independent of Starting ordering. Once consumed, a
+                    // redirect or later child request cannot reuse this grant.
+                    value->admit_document_request = false;
+                    allowed = true;
+                }
+            });
+            if (allowed) return S_OK;
+            // Keep the immutable local response available even after the weak
+            // context/window has expired. No late request is admitted by default.
+            const auto response = args->put_Response(denied_response.Get());
+            if (FAILED(response)) {
+                callback(weak_context, weak_window, [&](auto &state, const auto &value) {
+                    state.provider_failed(value, "WebView2 cannot deny a document request");
+                });
+                if (sender) sender->Stop();
+            }
+            return response;
+        }).Get(), &token);
+    if (FAILED(result)) return false;
+    result = window->view->add_NavigationStarting(Callback<ICoreWebView2NavigationStartingEventHandler>(
         [weak_context, weak_window](ICoreWebView2 *, ICoreWebView2NavigationStartingEventArgs *args) -> HRESULT {
             if (!args) return E_POINTER;
             args->put_Cancel(TRUE);
@@ -508,7 +568,10 @@ bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shar
                     fail_initialization(state, value, "WebView2 initial document did not match its authorized HTML content");
                     return;
                 }
-                if (id == value->navigation_id) value->policy_cancelled = true;
+                if (id == value->navigation_id) {
+                    value->policy_cancelled = true;
+                    value->admit_document_request = false;
+                }
                 std::string url;
                 if (!narrow(uri.value, url)) { state.provider_failed(value, "WebView2 requested URI exceeds text contract"); return; }
                 state.navigation_requested(value, url);
@@ -556,6 +619,7 @@ bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shar
                 }
                 if (value->failed || id != value->navigation_id) return;
                 value->admit_request = false; value->navigation_id = 0;
+                value->admit_document_request = false;
                 value->fragment_request = false;
                 if (value->bootstrap) {
                     value->bootstrap = false;
@@ -907,12 +971,15 @@ void navigate_common(nilwv_context_v1 *context, std::int64_t id, nilwv_text_v1 i
             state.navigation_finished(value, operation, true, repeated_source, ""); return;
         }
         value->admit_request = true; value->policy_cancelled = false; value->navigation_id = 0;
+        value->admit_document_request = !html && !fragment &&
+            (data.compare(0, 7, "http://") == 0 || data.compare(0, 8, "https://") == 0);
         value->requested_uri = uri; value->navigation_operation = operation;
         value->requested_html_uri = std::move(html_uri);
         value->fragment_request = fragment;
         const HRESULT result = html ? value->view->NavigateToString(text.c_str()) : value->view->Navigate(text.c_str());
         if (FAILED(result)) {
             value->admit_request = false; value->fragment_request = false;
+            value->admit_document_request = false;
             value->navigation_operation = 0;
             value->requested_html_uri.clear();
             state.reject(value, operation, out, "WebView2 rejected the navigation");
@@ -969,6 +1036,7 @@ void poll(nilwv_context_v1 *context, std::int64_t id, nilwv_result_v1 *out) noex
         state.expire_operations();
         for (const auto &weak : state.native_windows) if (auto value = weak.lock(); value && value->failed) {
             value->admit_request = false;
+            value->admit_document_request = false;
             if (value->view) value->view->Stop();
         }
         collect_profiles(state, Clock::now() + std::chrono::milliseconds(2), 256);

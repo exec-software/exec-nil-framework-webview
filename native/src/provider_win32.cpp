@@ -485,11 +485,38 @@ bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shar
                     return;
                 }
                 WideText raw; std::string url;
-                if (okay && (!sender || FAILED(sender->get_Source(&raw.value)) || !narrow(raw.value, url))) {
+                COREWEBVIEW2_WEB_ERROR_STATUS web_error = COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;
+                int http_status = 0;
+                if (!okay && !value->policy_cancelled) {
+                    if (FAILED(args->get_WebErrorStatus(&web_error))) {
+                        state.provider_failed(value, "WebView2 navigation error metadata unavailable"); return;
+                    }
+                    ComPtr<ICoreWebView2NavigationCompletedEventArgs2> response;
+                    if (SUCCEEDED(args->QueryInterface(IID_PPV_ARGS(&response)))) {
+                        if (FAILED(response->get_HttpStatusCode(&http_status))) http_status = 0;
+                    }
+                    // WebView2 reports HTTP error documents as unsuccessful.
+                    // A completed 4xx/5xx response with no native transport,
+                    // certificate, cancellation or authentication error is still
+                    // a document the application can inspect. Require the exact
+                    // authorized HTTP(S) document identity as well as its status.
+                    if (http_status >= 400 && http_status <= 599 &&
+                        web_error == COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN) {
+                        if (!sender || FAILED(sender->get_Source(&raw.value)) || !raw.value || !narrow(raw.value, url)) {
+                            state.provider_failed(value, "WebView2 HTTP error document URI unavailable"); return;
+                        }
+                        okay = (url.compare(0, 7, "http://") == 0 || url.compare(0, 8, "https://") == 0) &&
+                            same_uri(value->requested_uri.Get(), raw.value);
+                    }
+                }
+                if (okay && !raw.value && (!sender || FAILED(sender->get_Source(&raw.value)) || !raw.value || !narrow(raw.value, url))) {
                     state.provider_failed(value, "WebView2 completed URI exceeds text contract"); return;
                 }
+                const std::string detail = value->policy_cancelled ? "WebView2 navigation cancelled by application policy" :
+                    okay ? "" : "WebView2 navigation failed (native=" + std::to_string(static_cast<int>(web_error)) +
+                    ", HTTP=" + std::to_string(http_status) + ")";
                 state.navigation_finished(value, value->navigation_operation, okay && !value->policy_cancelled, url,
-                    value->policy_cancelled ? "WebView2 navigation cancelled by application policy" : okay ? "" : "WebView2 navigation failed",
+                    detail,
                     value->policy_cancelled ? NILWV_FAILURE_CANCELLED : NILWV_FAILURE_NATIVE);
                 value->navigation_operation = 0;
             });

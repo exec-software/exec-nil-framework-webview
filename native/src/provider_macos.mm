@@ -300,10 +300,10 @@ void show(nilwv_context_v1 *context, std::int64_t id, nilwv_result_v1 *out) {
     call(context, out, [&](MacContext &state) { auto value = state.window(id, out); if (!value) return;
         [std::static_pointer_cast<MacWindow>(value)->native_window makeKeyAndOrderFront:nil]; success(out); });
 }
-void navigate_common(nilwv_context_v1 *context, std::int64_t id, nilwv_text_v1 input, nilwv_result_v1 *out, bool html) {
+void navigate_common(nilwv_context_v1 *context, std::int64_t window_id, nilwv_text_v1 input, nilwv_result_v1 *out, bool html) {
     call(context, out, [&](MacContext &state) {
         std::string data; if (!state.read_text(input, data, out, html)) return;
-        auto base = state.window(id, out); if (!base) return; auto value = std::static_pointer_cast<MacWindow>(base);
+        auto base = state.window(window_id, out); if (!base) return; auto value = std::static_pointer_cast<MacWindow>(base);
         NSURL *url = html ? [NSURL URLWithString:@"about:blank"] : [NSURL URLWithString:to_ns(data)];
         if (!html && (!navigation_uri(data) || !url || (![url.scheme isEqualToString:@"about"] && !url.host.length))) {
             state.fail(out, NILWV_E_ARGUMENT, "WebView navigation requires an HTTP(S) URI or about:blank"); return;

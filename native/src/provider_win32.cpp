@@ -281,6 +281,9 @@ void drain_profiles(WinContext &state) noexcept {
         std::fflush(stderr);
     }
 }
+void fail_initialization(WinContext &state, const std::shared_ptr<WinWindow> &value, const char *detail) {
+    state.initialization_failed(value, detail); dispose(value);
+}
 LRESULT CALLBACK window_proc(HWND handle, UINT message, WPARAM wparam, LPARAM lparam) noexcept {
     if (message == WM_NCCREATE) {
         auto create = reinterpret_cast<CREATESTRUCTW *>(lparam);
@@ -289,7 +292,10 @@ LRESULT CALLBACK window_proc(HWND handle, UINT message, WPARAM wparam, LPARAM lp
     auto binding = reinterpret_cast<Binding *>(GetWindowLongPtrW(handle, GWLP_USERDATA));
     if (binding) {
         if (message == WM_CLOSE) {
-            callback(binding->context, binding->window, [](auto &state, const auto &value) { state.close_requested(value); });
+            callback(binding->context, binding->window, [](auto &state, const auto &value) {
+                if (value->bootstrap) fail_initialization(state, value, "WebView2 host window closed during initialization");
+                else state.close_requested(value);
+            });
             return 0;
         }
         if (message == WM_SIZE) {
@@ -335,10 +341,6 @@ bool same_uri(IUri *expected, LPCWSTR text) {
     return expected && SUCCEEDED(CreateUri(text, Uri_CREATE_CANONICALIZE, 0, &actual)) &&
         SUCCEEDED(expected->IsEqual(actual.Get(), &equal)) && equal;
 }
-void fail_initialization(WinContext &state, const std::shared_ptr<WinWindow> &value, const char *detail) {
-    state.initialization_failed(value, detail); dispose(value);
-}
-
 bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shared_ptr<WinWindow> &window) {
     const std::weak_ptr<WinContext> weak_context = context;
     const std::weak_ptr<WinWindow> weak_window = window;
@@ -353,9 +355,23 @@ bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shar
                 if (FAILED(args->get_Uri(&uri.value)) || FAILED(args->get_IsRedirected(&redirected)) || FAILED(args->get_NavigationId(&id))) {
                     state.provider_failed(value, "WebView2 navigation metadata unavailable"); return;
                 }
+                // WebView2 may announce its own initial about:blank before
+                // the asynchronous document-created helper is installed. It
+                // remains cancelled; only our subsequent NavigateToString is
+                // authorized. Do not expose an unrecoverable navigation event
+                // before the consumer has received Ready.
+                if (value->bootstrap && !value->admit_request) {
+                    if (!redirected && uri.value && !wcscmp(uri.value, L"about:blank")) return;
+                    fail_initialization(state, value, "WebView2 requested an unexpected navigation before initialization");
+                    return;
+                }
                 if (value->admit_request && !redirected && same_uri(value->requested_uri.Get(), uri.value)) {
                     value->admit_request = false; value->navigation_id = id;
                     if (FAILED(args->put_Cancel(FALSE))) state.provider_failed(value, "WebView2 cannot authorize navigation");
+                    return;
+                }
+                if (value->bootstrap) {
+                    fail_initialization(state, value, "WebView2 initial document did not match the authorized about:blank navigation");
                     return;
                 }
                 if (id == value->navigation_id) value->policy_cancelled = true;
@@ -371,6 +387,10 @@ bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shar
             if (!args) return E_POINTER;
             args->put_Cancel(TRUE);
             callback(weak_context, weak_window, [&](auto &state, const auto &value) {
+                if (value->bootstrap) {
+                    fail_initialization(state, value, "WebView2 requested a child-frame navigation during initialization");
+                    return;
+                }
                 WideText raw; std::string url;
                 if (FAILED(args->get_Uri(&raw.value)) || !narrow(raw.value, url)) state.provider_failed(value, "WebView2 frame URI unavailable");
                 else state.navigation_requested(value, url);
@@ -408,6 +428,10 @@ bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shar
     result = window->view->add_WebMessageReceived(Callback<ICoreWebView2WebMessageReceivedEventHandler>(
         [weak_context, weak_window](ICoreWebView2 *, ICoreWebView2WebMessageReceivedEventArgs *args) -> HRESULT {
             callback(weak_context, weak_window, [&](auto &state, const auto &value) {
+                if (value->bootstrap) {
+                    fail_initialization(state, value, "WebView2 received a page message during initialization");
+                    return;
+                }
                 WideText raw, source; std::string payload; Provenance provenance;
                 if (!args || FAILED(args->TryGetWebMessageAsString(&raw.value)) || !narrow(raw.value, payload)) {
                     state.provider_failed(value, "WebView2 message must be bounded serialized JSON text"); return;
@@ -429,6 +453,10 @@ bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shar
             if (!args) return E_POINTER;
             args->put_Handled(TRUE);
             callback(weak_context, weak_window, [&](auto &state, const auto &value) {
+                if (value->bootstrap) {
+                    fail_initialization(state, value, "WebView2 requested a new window during initialization");
+                    return;
+                }
                 WideText raw; std::string url;
                 if (FAILED(args->get_Uri(&raw.value)) || !narrow(raw.value, url)) state.provider_failed(value, "WebView2 new-window URI unavailable");
                 else state.navigation_requested(value, url);
@@ -451,7 +479,10 @@ bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shar
     if (FAILED(result)) return false;
     result = window->view->add_WindowCloseRequested(Callback<ICoreWebView2WindowCloseRequestedEventHandler>(
         [weak_context, weak_window](ICoreWebView2 *, IUnknown *) -> HRESULT {
-            callback(weak_context, weak_window, [](auto &state, const auto &value) { state.close_requested(value); });
+            callback(weak_context, weak_window, [](auto &state, const auto &value) {
+                if (value->bootstrap) fail_initialization(state, value, "WebView2 requested closure during initialization");
+                else state.close_requested(value);
+            });
             return S_OK;
         }).Get(), &token);
     if (FAILED(result)) return false;

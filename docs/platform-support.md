@@ -1,21 +1,45 @@
 # Platform support and evidence
 
-The initial provider implementations target the four hosts below. Actual
-browser qualification is pending; this table must not be read as a release or
-SDK compatibility guarantee.
+The current provider profile targets the four hosts below. The table records
+actual source-consumer tests, not a release or installed-SDK compatibility
+guarantee. Windows browser qualification remains in progress.
 
 | Host | Native provider | Native page-message metadata | Current browser evidence |
 | --- | --- | --- | --- |
-| Linux x86-64 | GTK4 + WebKitGTK 6 | None; capabilities are zero, sender fields/frame unknown | Pending |
-| Windows x86-64 | Win32 + WebView2 | Native sender URL and main-frame identity from the top-level message event; origin unavailable | Pending |
-| macOS Intel | AppKit + WKWebView | Native frame URL, security origin when available, and frame identity | Pending |
-| macOS Apple Silicon | AppKit + WKWebView | Same API profile as Intel; requires its own architecture run | Pending |
+| Linux x86-64 | GTK4 + WebKitGTK 6 | None; capabilities are zero, sender fields/frame unknown | Four real browser routes passed ([run](https://github.com/exec-software/exec-nil-framework-webview/actions/runs/43468602639)) |
+| Windows x86-64 | Win32 + WebView2 | Native sender URL and main-frame identity from the top-level message event; origin unavailable | Build and synthetic routes pass; real-browser initialization under investigation |
+| macOS Intel | AppKit + WKWebView | Native frame URL, security origin when available, and frame identity | Four real browser routes passed ([run](https://github.com/exec-software/exec-nil-framework-webview/actions/runs/43468602639)) |
+| macOS Apple Silicon | AppKit + WKWebView | Same API profile as Intel, tested independently | Four real browser routes passed ([run](https://github.com/exec-software/exec-nil-framework-webview/actions/runs/43466470278)) |
 
 Shared controls have local native coverage, including owner-thread and handle
 checks, timeouts, queue limits, immutable snapshots, JSON validation and actual
 generated JavaScript transport tests. Matrix wrapper checks with a synthetic
 provider pass through textual NIL, binary NIL, native compilation and JIT.
 These establish the checked interface, not a real engine's behavior.
+
+## Recorded source qualification
+
+The November 13, 2026 runs above use framework revision
+`e7bc2a00e6854084b7b5084e29fa50456cbe8977`. Linux and Intel Mac tested the
+`e34c495` WebView branch through GitHub's `9d9c156` merge revision; Apple
+Silicon tested `59330e5` through merge revision `8b99c54`.
+
+Each passing host verified seven exact framework/provider contracts: 57
+runtime checks, 28 WebView ABI checks, 40 UI ABI checks, 216 formatted-text
+checks, 392 markup checks, 196 shared-provider checks and 36 JavaScript
+transport checks. It then executed four synthetic and four actual browser
+consumers through textual NIL, binary NIL, AOT and JIT. Each browser route
+passed all 16 behavior groups, including navigation policy, messages, dialogs,
+script failures, copied events and window closure. No contract was skipped.
+
+All 14 owned commands and the loopback HTTP fixture cleaned up; source,
+toolchain, standard-library and copied-provider hashes remained unchanged.
+Linux used GTK 4.14.5 and WebKitGTK 2.52.6, and restored the exact pre-test
+AppArmor profile inventory. The Mac runs used system WKWebView on macOS
+15.7.9 (Intel) and 15.8.2 (Apple Silicon). Windows' first browser run failed
+before `Ready`; its failure evidence and successful process/profile cleanup
+are retained. The follow-up records the actual WebView2 environment version
+for each initialized window as well as the separately pinned SDK version.
 
 ## Dependencies and builds
 

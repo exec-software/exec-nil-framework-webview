@@ -29,6 +29,10 @@ expect-ready receives surface as Window, deadline as number, host as text begin 
     expect ready.sequence is greater than 0
     consider ready.kind
         when EventKind.Ready then expect yes
+        when EventKind.NavigationRequested then evaluate panic with ("expected Ready; got NavigationRequested: " plus ready.payload-json)
+        when EventKind.CloseRequested then evaluate panic with "expected Ready; got CloseRequested"
+        when EventKind.InitializationFailed then evaluate panic with ("initialization failed: " plus ready.detail)
+        when EventKind.ProviderFailed then evaluate panic with ("provider failed before Ready: " plus ready.detail)
         when _ then evaluate panic with ("expected Ready: " plus ready.detail)
     end consider
     consider ready.operation

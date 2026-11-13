@@ -11,12 +11,12 @@ WebView2 on Windows, and WKWebView on macOS.
 
 ## Status
 
-This is the initial implementation. Shared ownership, JSON transport and checked
-framework integration have local automated coverage. The Matrix wrapper has
-been exercised with a synthetic provider through textual NIL, binary NIL,
-native compilation and JIT. Actual browser qualification on Linux, Windows,
-Intel macOS and Apple Silicon macOS is pending. A synthetic provider pass does
-not establish browser behavior or qualify a published SDK.
+The current source implementation has passed real-browser tests on Linux,
+Intel macOS and Apple Silicon macOS through textual NIL, binary NIL, native
+compilation and JIT. Windows builds and passes the framework, provider and
+synthetic-consumer contracts; its actual browser qualification is in progress.
+See [platform evidence](docs/platform-support.md) for the tested revisions and
+remaining work. These source checks do not qualify a published SDK.
 
 The current profile provides hidden-window creation, explicit showing,
 navigation, loading HTML, synchronous JavaScript function evaluation, copied

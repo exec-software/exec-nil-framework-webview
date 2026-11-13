@@ -60,6 +60,8 @@ struct Profile {
     bool await_browser_exit = false;
     bool browser_resources_released = false;
     bool retired = false;
+    bool cleanup_controller_requested = false;
+    bool cleanup_controller_failed = false;
 
     void release_monitor() noexcept {
         if (exit_registered && exit_environment)
@@ -154,6 +156,44 @@ bool observe_browser_exit(const std::shared_ptr<Profile> &profile, ICoreWebView2
         return true;
     } catch (...) { return false; }
 }
+bool private_environment(const std::shared_ptr<Profile> &profile, ICoreWebView2Environment *environment) {
+    ComPtr<ICoreWebView2Environment7> identified;
+    WideText actual;
+    return environment && SUCCEEDED(environment->QueryInterface(IID_PPV_ARGS(&identified))) &&
+        SUCCEEDED(identified->get_UserDataFolder(&actual.value)) && actual.value &&
+        _wcsicmp(actual.value, profile->directory.c_str()) == 0;
+}
+void close_retired_environment(const std::shared_ptr<Profile> &profile, ICoreWebView2Environment *environment) noexcept {
+    if (profile->cleanup_controller_requested) return;
+    profile->cleanup_controller_requested = true;
+    profile->await_browser_exit = true;
+    profile->browser_resources_released = false;
+    try {
+        if (!private_environment(profile, environment)) { profile->cleanup_controller_failed = true; return; }
+        const auto completion = std::make_shared<Completion>(profile);
+        // An environment completed after its window closed may never have had
+        // a controller to Close. Finish that native lifecycle invisibly, so the
+        // same BrowserProcessExited/resource-release gate can still be used.
+        const auto result = environment->CreateCoreWebView2Controller(HWND_MESSAGE,
+            Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                [profile, completion](HRESULT error, ICoreWebView2Controller *controller) -> HRESULT {
+                    const FinishCompletion finished{completion};
+                    if (FAILED(error) || !controller) profile->cleanup_controller_failed = true;
+                    if (controller) {
+                        ComPtr<ICoreWebView2> view; UINT32 pid = 0;
+                        if (FAILED(controller->get_CoreWebView2(&view)) || !view ||
+                            FAILED(view->get_BrowserProcessId(&pid)) || !pid ||
+                            (profile->browser && GetProcessId(profile->browser) != pid) ||
+                            (!profile->browser && !(profile->browser = OpenProcess(
+                                SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid))))
+                            profile->cleanup_controller_failed = true;
+                        if (FAILED(controller->Close())) profile->cleanup_controller_failed = true;
+                    }
+                    return S_OK;
+                }).Get());
+        if (FAILED(result)) { completion->finish(); profile->cleanup_controller_failed = true; }
+    } catch (...) { profile->cleanup_controller_failed = true; }
+}
 std::shared_ptr<Profile> create_profile() {
     wchar_t parent[32768]{};
     const DWORD length = GetTempPathW(static_cast<DWORD>(std::size(parent)), parent);
@@ -224,7 +264,7 @@ bool collect_profiles(WinContext &state, Clock::time_point until, unsigned budge
     for (auto &profile : state.profiles) {
         if (!profile) continue;
         complete = false;
-        if (!profile->retired || profile->pending.load(std::memory_order_acquire)) continue;
+        if (!profile->retired || profile->pending.load(std::memory_order_acquire) || profile->cleanup_controller_failed) continue;
         if (profile->await_browser_exit && !profile->browser_resources_released) continue;
         if (profile->browser && WaitForSingleObject(profile->browser, 0) != WAIT_OBJECT_0) continue;
         profile->release_monitor();
@@ -273,8 +313,16 @@ void drain_profiles(WinContext &state) noexcept {
     }
     if (quit_seen) PostQuitMessage(static_cast<int>(quit_code));
     bool retained = false;
-    for (auto &profile : state.profiles) if (profile) {
+    for (unsigned slot = 0; slot < state.profiles.size(); ++slot) {
+        auto &profile = state.profiles[slot];
+        if (!profile) continue;
         retained = true;
+        const DWORD browser_wait = profile->browser ? WaitForSingleObject(profile->browser, 0) : WAIT_FAILED;
+        std::fprintf(stderr, "nilwebview: retained profile slot=%u pending=%u retired=%d awaiting_exit=%d "
+            "resources_released=%d has_browser=%d browser_wait=%lu cleanup_controller=%d cleanup_failed=%d\n",
+            slot, profile->pending.load(std::memory_order_acquire), profile->retired,
+            profile->await_browser_exit, profile->browser_resources_released, profile->browser != nullptr,
+            static_cast<unsigned long>(browser_wait), profile->cleanup_controller_requested, profile->cleanup_controller_failed);
         // Break environment/callback ownership on timeout. Late callbacks hold
         // independent cancelled profile state and weak context/window handles.
         profile->release_monitor();
@@ -710,19 +758,23 @@ void window(nilwv_context_v1 *context, nilwv_text_v1 title, std::int64_t width, 
             Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
                 [weak_context, weak_window, profile, completion](HRESULT error, ICoreWebView2Environment *environment) -> HRESULT {
                     const FinishCompletion finished{completion};
+                    // Only an existing owner can initiate work during its drain.
+                    // A callback arriving after the bounded context lifetime must
+                    // not launch a new controller or retain new COM observers.
+                    const auto owner_context = weak_context.lock();
+                    if (!owner_context || !owner_context->owner_thread()) return S_OK;
                     bool observed = false;
                     if (SUCCEEDED(error) && environment) {
                         observed = observe_browser_exit(profile, environment);
                         if (!observed) profile->await_browser_exit = true;
                     }
+                    bool controller_requested = false;
+                    bool ownership_failed = false;
                     callback(weak_context, weak_window, [&](auto &owner, const auto &live_window) {
                         if (live_window->failed) return;
                         if (FAILED(error) || !environment) { fail_initialization(owner, live_window, "WebView2 environment initialization failed"); return; }
-                        ComPtr<ICoreWebView2Environment7> identified;
-                        WideText actual;
-                        if (FAILED(environment->QueryInterface(IID_PPV_ARGS(&identified))) ||
-                            FAILED(identified->get_UserDataFolder(&actual.value)) || !actual.value ||
-                            _wcsicmp(actual.value, profile->directory.c_str()) != 0) {
+                        if (!private_environment(profile, environment)) {
+                            ownership_failed = true;
                             fail_initialization(owner, live_window, "WebView2 did not honor its isolated profile directory"); return;
                         }
                         if (!observed) {
@@ -741,6 +793,7 @@ void window(nilwv_context_v1 *context, nilwv_text_v1 title, std::int64_t width, 
                         const auto controller_completion = std::make_shared<Completion>(profile);
                         const bool browser_already_started = profile->await_browser_exit;
                         profile->await_browser_exit = true;
+                        controller_requested = true;
                         const auto creation = environment->CreateCoreWebView2Controller(live_window->handle,
                             Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
                                 [weak_context, weak_window, profile, controller_completion](HRESULT failure, ICoreWebView2Controller *controller) -> HRESULT {
@@ -772,6 +825,8 @@ void window(nilwv_context_v1 *context, nilwv_text_v1 title, std::int64_t width, 
                             fail_initialization(owner, live_window, "WebView2 controller creation unavailable");
                         }
                     });
+                    if (SUCCEEDED(error) && environment && observed && profile->retired && !controller_requested && !ownership_failed)
+                        close_retired_environment(profile, environment);
                     return S_OK;
                 }).Get());
         if (FAILED(result)) {

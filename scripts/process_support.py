@@ -82,6 +82,60 @@ class WindowsJob:
                 "cannot inspect owned Windows job")
         return info.ActiveProcesses != 0
 
+    def members(self):
+        """Diagnose only stable handles positively verified inside this job.
+
+        Never inspect command lines or environments. A PID can be reused between
+        enumeration and OpenProcess, so membership is checked on the handle
+        before recording its executable basename. This does not terminate it.
+        """
+        from ctypes import wintypes
+        kernel = self.kernel
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+        kernel.IsProcessInJob.restype = wintypes.BOOL
+        kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                    wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
+
+        class Members(ctypes.Structure):
+            _fields_ = [("assigned", ctypes.c_uint32), ("listed", ctypes.c_uint32),
+                        ("pids", ctypes.c_size_t * 128)]
+
+        info = Members()
+        returned = wintypes.DWORD()
+        okay = kernel.QueryInformationJobObject(self.handle, 3, ctypes.byref(info),
+                    ctypes.sizeof(info), ctypes.byref(returned))
+        error = 0 if okay else ctypes.get_last_error()
+        if not okay and error != 234:  # ERROR_MORE_DATA: retain bounded partial list
+            return {"query_error": error, "processes": []}
+        report = {"assigned": info.assigned, "listed": info.listed,
+                  "truncated": not okay or info.listed > 128, "processes": []}
+        for pid in info.pids[:min(info.listed, 128)]:
+            row = {"pid": int(pid)}
+            handle = kernel.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+            if not handle:
+                row["open_error"] = ctypes.get_last_error()
+            else:
+                try:
+                    owned = wintypes.BOOL()
+                    if not kernel.IsProcessInJob(handle, self.handle, ctypes.byref(owned)):
+                        row["membership_error"] = ctypes.get_last_error()
+                    elif not owned.value:
+                        row["membership_changed"] = True
+                    else:
+                        buffer = ctypes.create_unicode_buffer(32768)
+                        size = wintypes.DWORD(len(buffer))
+                        if kernel.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                            row["image"] = Path(buffer.value).name
+                        else:
+                            row["image_error"] = ctypes.get_last_error()
+                finally:
+                    kernel.CloseHandle(handle)
+            report["processes"].append(row)
+        return report
+
     def terminate(self):
         require(bool(self.kernel.TerminateJobObject(self.handle, 124)), "cannot terminate owned Windows job")
 
@@ -160,6 +214,11 @@ def run(command: list[str], *, cwd: Path, env: dict[str, str], evidence: Path,
             active = job.active if job else lambda: group_active(process.pid)
             row["unexpected_descendants"] = not drain(active, 5)
             if row["unexpected_descendants"]:
+                if job:
+                    try:
+                        row["remaining_owned_processes"] = job.members()
+                    except Exception as error:
+                        row["member_diagnostic_error"] = type(error).__name__
                 problem = AssertionError(label + " left a descendant process after exit")
         except subprocess.TimeoutExpired:
             row["timed_out"] = True

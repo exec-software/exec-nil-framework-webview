@@ -67,6 +67,15 @@ source builds from installed SDKs. Record failures, missing desktop sessions
 and skipped assertions explicitly. Do not activate a candidate SDK or replace a
 user installation as part of qualification.
 
+Hosted Linux qualification grants only the installed WebKit bubblewrap
+executable a temporary AppArmor user-namespace allowance, verifies a real
+namespace launch, and removes the owned profile afterward. The WebKit sandbox
+stays enabled; no global user-namespace policy is relaxed. Hosted Windows
+qualification disables optional MSVC telemetry and temporarily removes only the
+selected compiler's verified optional uploader. Its bytes, owner/group/DACL and
+saved telemetry preferences are restored in the job's final cleanup. These
+steps target disposable GitHub runners, not developer machines.
+
 ## Distribution
 
 Original nil-webview source is MIT licensed. GTK/WebKitGTK and their dependencies

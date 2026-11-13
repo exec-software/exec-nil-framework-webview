@@ -64,6 +64,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build llvm-18-dev libgtk-4-dev libwebkitgtk-6.0-dev pkg-config xvfb dbus-x11
           echo "NIL_CI_LLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm" >> "$GITHUB_ENV"
+      - name: Permit the installed Linux browser sandbox on this hosted runner
+        if: runner.os == 'Linux'
+        timeout-minutes: 3
+        run: bash webview/scripts/ci-linux-browser.sh setup
       - name: Locate macOS LLVM development package
         if: runner.os == 'macOS'
         timeout-minutes: 5
@@ -77,12 +81,58 @@ jobs:
         shell: pwsh
         timeout-minutes: 3
         run: |
+          $ErrorActionPreference = 'Stop'
+          $owned = Join-Path $env:RUNNER_TEMP 'webview-msvc-telemetry'
+          if (Test-Path -LiteralPath $owned) { throw 'Telemetry backup directory must be fresh' }
+          New-Item -ItemType Directory -Path $owned | Out-Null
+          $evidence = Join-Path $env:RUNNER_TEMP 'webview-ci/evidence'
+          New-Item -ItemType Directory -Path $evidence -Force | Out-Null
+          $manifest = Join-Path $owned 'manifest.json'
+          $report = [ordered]@{ scope = 'ephemeral GitHub runner, selected MSVC x64 toolchain only'; registry = @(); uploader = $null }
+          function Save-TelemetryState {
+            $report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifest -Encoding utf8
+            Copy-Item -LiteralPath $manifest -Destination (Join-Path $evidence 'msvc-telemetry-setup.json') -Force
+          }
+          Save-TelemetryState
+          # The user requested compiler telemetry disabled. These supported
+          # VS2022 opt-outs apply only to this disposable hosted runner.
+          foreach ($key in @('HKLM:\SOFTWARE\WOW6432Node\Microsoft\VSCommon\17.0\SQM', 'HKLM:\SOFTWARE\Policies\Microsoft\VisualStudio\SQM')) {
+            $item = Get-Item -LiteralPath $key -ErrorAction SilentlyContinue
+            $present = $null -ne $item -and $item.GetValueNames() -contains 'OptIn'
+            if ($present -and $item.GetValueKind('OptIn').ToString() -ne 'DWord') { throw 'Unexpected Visual Studio telemetry registry type' }
+            $report.registry += [ordered]@{ key = $key; present = $present; value = $(if ($present) { $item.GetValue('OptIn') } else { $null }) }
+            Save-TelemetryState
+            New-Item -Path $key -Force | Out-Null
+            New-ItemProperty -LiteralPath $key -Name OptIn -PropertyType DWord -Value 0 -Force | Out-Null
+          }
+          $env:VSCMD_SKIP_SENDTELEMETRY = '1'
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
           $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $installation) { throw 'Visual Studio x64 Build Tools are required' }
           & (Join-Path $installation 'Common7/Tools/Launch-VsDevShell.ps1') -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
-          if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) { throw 'MSVC compiler was not activated' }
-          foreach ($name in @('PATH','INCLUDE','LIB','LIBPATH','VSINSTALLDIR','VCINSTALLDIR','VCToolsInstallDir','VCToolsVersion','WindowsSdkDir','WindowsSDKVersion','UniversalCRTSdkDir','UCRTVersion')) {
+          $compiler = (Get-Command cl.exe -ErrorAction Stop).Source
+          $expectedCompiler = Join-Path $env:VCToolsInstallDir 'bin/Hostx64/x64/cl.exe'
+          if ((Resolve-Path -LiteralPath $compiler).Path -ine (Resolve-Path -LiteralPath $expectedCompiler).Path) { throw 'Selected compiler differs from the activated x64 toolchain' }
+          # The documented registry opt-out alone previously left VCTIP alive.
+          # Quarantine only this selected compiler's adjacent optional uploader;
+          # retain its signed bytes and ACL for the always-run restoration step.
+          $uploader = Join-Path (Split-Path -Parent $compiler) 'vctip.exe'
+          if (Test-Path -LiteralPath $uploader) {
+            $item = Get-Item -LiteralPath $uploader
+            if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.Length -gt 16777216) { throw 'Unexpected optional uploader file' }
+            $signature = Get-AuthenticodeSignature -LiteralPath $uploader
+            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch '(^|, )O=Microsoft Corporation(,|$)') { throw 'Optional uploader lacks a valid Microsoft signature' }
+            $hash = (Get-FileHash -LiteralPath $uploader -Algorithm SHA256).Hash
+            $backup = Join-Path $owned 'vctip.exe'
+            $sections = [Security.AccessControl.AccessControlSections]::Access -bor [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Group
+            $sddl = (Get-Acl -LiteralPath $uploader).GetSecurityDescriptorSddlForm($sections)
+            [IO.File]::WriteAllText((Join-Path $owned 'uploader-acl.sddl'), $sddl)
+            $report.uploader = [ordered]@{ source = $uploader; compiler = $compiler; backup = $backup; sha256 = $hash; signer = $signature.SignerCertificate.Subject; lastWriteUtc = $item.LastWriteTimeUtc.ToString('o') }
+            Save-TelemetryState
+            Move-Item -LiteralPath $uploader -Destination $backup
+            if ((Test-Path -LiteralPath $uploader) -or (Get-FileHash -LiteralPath $backup -Algorithm SHA256).Hash -ne $hash) { throw 'Optional uploader quarantine verification failed' }
+          }
+          foreach ($name in @('PATH','INCLUDE','LIB','LIBPATH','VSINSTALLDIR','VCINSTALLDIR','VCToolsInstallDir','VCToolsVersion','WindowsSdkDir','WindowsSDKVersion','UniversalCRTSdkDir','UCRTVersion','VSCMD_SKIP_SENDTELEMETRY')) {
             $value = [Environment]::GetEnvironmentVariable($name)
             if ($value) { "$name=$value" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append }
           }
@@ -131,6 +181,64 @@ jobs:
           "$NIL_CI_PYTHON" -B webview/scripts/ci-build.py --phase desktop \
             --framework framework --output "$RUNNER_TEMP/webview-ci" \
             --expected-system "$NIL_CI_SYSTEM" --expected-machine "$NIL_CI_ARCH"
+      - name: Remove only the owned Linux AppArmor allowance
+        if: always() && runner.os == 'Linux'
+        timeout-minutes: 3
+        run: bash webview/scripts/ci-linux-browser.sh cleanup
+      - name: Restore selected Windows optional uploader and telemetry settings
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $owned = Join-Path $env:RUNNER_TEMP 'webview-msvc-telemetry'
+          $manifest = Join-Path $owned 'manifest.json'
+          if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) { exit 0 }
+          $state = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+          $result = [ordered]@{ status = 'FAIL'; uploader = 'not quarantined'; registry = @() }
+          try {
+            if ($state.uploader) {
+              $entry = $state.uploader
+              $expectedBackup = Join-Path $owned 'vctip.exe'
+              $expectedSource = Join-Path (Split-Path -Parent $entry.compiler) 'vctip.exe'
+              if ($entry.backup -ine $expectedBackup -or $entry.source -ine $expectedSource) { throw 'Uploader backup metadata does not identify the selected adjacent file' }
+              if (Test-Path -LiteralPath $entry.backup -PathType Leaf) {
+                if (Test-Path -LiteralPath $entry.source) { throw 'Refusing to overwrite an uploader restoration collision' }
+                if ((Get-FileHash -LiteralPath $entry.backup -Algorithm SHA256).Hash -ne $entry.sha256) { throw 'Uploader backup hash changed' }
+                Move-Item -LiteralPath $entry.backup -Destination $entry.source
+                $sections = [Security.AccessControl.AccessControlSections]::Access -bor [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Group
+                $sddl = [IO.File]::ReadAllText((Join-Path $owned 'uploader-acl.sddl'))
+                $acl = [Security.AccessControl.FileSecurity]::new()
+                $acl.SetSecurityDescriptorSddlForm($sddl, $sections)
+                Set-Acl -LiteralPath $entry.source -AclObject $acl
+                [IO.File]::SetLastWriteTimeUtc($entry.source, [DateTime]::Parse($entry.lastWriteUtc).ToUniversalTime())
+              }
+              if ((Get-FileHash -LiteralPath $entry.source -Algorithm SHA256).Hash -ne $entry.sha256) { throw 'Restored uploader hash differs' }
+              $sections = [Security.AccessControl.AccessControlSections]::Access -bor [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Group
+              $savedSddl = [IO.File]::ReadAllText((Join-Path $owned 'uploader-acl.sddl'))
+              if ((Get-Acl -LiteralPath $entry.source).GetSecurityDescriptorSddlForm($sections) -cne $savedSddl) { throw 'Restored uploader owner/group/DACL differs' }
+              $result.uploader = 'restored with original SHA256 and owner/group/DACL'
+            }
+            foreach ($entry in $state.registry) {
+              if ($entry.key -notin @('HKLM:\SOFTWARE\WOW6432Node\Microsoft\VSCommon\17.0\SQM', 'HKLM:\SOFTWARE\Policies\Microsoft\VisualStudio\SQM')) { throw 'Unexpected registry restoration target' }
+              $current = Get-ItemPropertyValue -LiteralPath $entry.key -Name OptIn -ErrorAction SilentlyContinue
+              if ($null -ne $current -and $current -ne 0) { throw 'Telemetry setting changed outside this step; preserving it' }
+              if ($entry.present) {
+                New-ItemProperty -LiteralPath $entry.key -Name OptIn -PropertyType DWord -Value $entry.value -Force | Out-Null
+              } elseif ($null -ne $current) {
+                Remove-ItemProperty -LiteralPath $entry.key -Name OptIn
+              }
+              $result.registry += $entry.key
+            }
+            $result.status = 'PASS'
+          } catch {
+            $result.error = $_.Exception.Message
+            throw
+          } finally {
+            $evidence = Join-Path $env:RUNNER_TEMP 'webview-ci/evidence'
+            New-Item -ItemType Directory -Path $evidence -Force | Out-Null
+            $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $evidence 'msvc-telemetry-restore.json') -Encoding utf8
+          }
       - name: Upload complete or partial evidence only
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

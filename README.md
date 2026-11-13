@@ -11,12 +11,12 @@ WebView2 on Windows, and WKWebView on macOS.
 
 ## Status
 
-The current source implementation has passed real-browser tests on Linux,
-Intel macOS and Apple Silicon macOS through textual NIL, binary NIL, native
-compilation and JIT. Windows builds and passes the framework, provider and
-synthetic-consumer contracts; its actual browser qualification is in progress.
-See [platform evidence](docs/platform-support.md) for the tested revisions and
-remaining work. These source checks do not qualify a published SDK.
+The current source profile is implemented on Linux, Windows, Intel macOS and
+Apple Silicon macOS. Each platform has a required real-browser check through
+textual NIL, binary NIL, native compilation and JIT. See
+[platform support and evidence](docs/platform-support.md) for the exact scope
+and [current checks](https://github.com/exec-software/exec-nil-framework-webview/actions/workflows/test.yml)
+for qualification results. These source checks do not qualify a published SDK.
 
 The current profile provides hidden-window creation, explicit showing,
 navigation, loading HTML, synchronous JavaScript function evaluation, copied

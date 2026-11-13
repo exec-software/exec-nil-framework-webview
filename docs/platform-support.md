@@ -75,6 +75,8 @@ qualification disables optional MSVC telemetry and temporarily removes only the
 selected compiler's verified optional uploader. Its bytes, owner/group/DACL and
 saved telemetry preferences are restored in the job's final cleanup. These
 steps target disposable GitHub runners, not developer machines.
+CMake's Windows probes and builds use embedded MSVC debug information (`/Z7`)
+to avoid leaving a persistent compiler PDB server after the owning command exits.
 
 ## Distribution
 

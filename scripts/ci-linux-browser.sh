@@ -75,6 +75,16 @@ def profile_text(name, executable):
             '}\n')
 
 
+def owned_profile_matches(row, metadata):
+    # AppArmor can expose an attachment as <unknown> when only its compiled
+    # matcher is exported (apparmorfs.c: seq_profile_attach_show). For our own
+    # fresh --add profile, trust the verified definition and unique name; the
+    # real namespace probe below verifies that bubblewrap can create its userns.
+    # This exception never applies to the pre-existing profile conflict check.
+    return (row['name'] == metadata['name'] and row['mode'] == 'unconfined' and
+            row['attach'] in (metadata['executable'], '<unknown>'))
+
+
 def expanded_patterns(pattern):
     # AppArmor supports brace alternatives. Conservative matching also treats
     # * as spanning /, so an ambiguous existing attachment is refused.
@@ -160,7 +170,7 @@ def cleanup(directory, temporary, evidence, parser, label='cleanup'):
     matches = [row for row in rows if row['name'] == metadata['name']]
     require(len(matches) <= 1, 'Owned AppArmor profile is ambiguous')
     if matches:
-        require(matches[0]['attach'] == metadata['executable'] and matches[0]['mode'] == 'unconfined',
+        require(owned_profile_matches(matches[0], metadata),
                 'Loaded AppArmor profile no longer matches the owned definition')
         captured(['sudo', '-n', str(parser), '--remove', '--skip-cache', str(profile)], evidence/(label + '-remove'))
     require(not any(row['name'] == metadata['name'] for row in snapshot(evidence, label + '-after')),
@@ -220,14 +230,22 @@ def main():
         attempted = True
         captured(['sudo', '-n', str(parser), '--add', '--skip-cache', str(profile)], evidence/'setup-add')
         loaded = [row for row in snapshot(evidence, 'setup-loaded') if row['name'] == name]
-        require(len(loaded) == 1 and loaded[0]['attach'] == str(executable) and loaded[0]['mode'] == 'unconfined',
+        require(len(loaded) == 1 and owned_profile_matches(loaded[0], metadata),
                 'Owned AppArmor profile was not loaded exactly')
+        probe = ('import json, os; from pathlib import Path; '
+                 'print(json.dumps({"uid": os.getuid(), '
+                 '"label": Path("/proc/self/attr/apparmor/current").read_text().strip()}))')
         output = captured([str(executable), '--die-with-parent', '--new-session', '--unshare-user',
                            '--uid', '0', '--gid', '0', '--unshare-pid', '--ro-bind', '/', '/',
-                           '--proc', '/proc', '--dev', '/dev', '--', '/usr/bin/id', '-u'], evidence/'userns-probe')
-        require(output.strip() == '0', 'Bubblewrap did not enter the requested private user namespace')
+                           '--proc', '/proc', '--dev', '/dev', '--', '/usr/bin/python3', '-I', '-c', probe],
+                          evidence/'userns-probe')
+        result = json.loads(output)
+        require(result['uid'] == 0, 'Bubblewrap did not enter the requested private user namespace')
+        # Record the child label; another existing attachment may legitimately
+        # transition it when Python is executed inside the verified namespace.
         write_json(evidence/'setup.json', {'status': 'PASS', 'name': name, 'bubblewrap_userns_probe': 'PASS',
-                                         'webkit_sandbox': 'enabled', 'global_policy_changed': False})
+                                         'apparmor_label': result['label'], 'webkit_sandbox': 'enabled',
+                                         'global_sysctls_changed': False})
         print('Verified bubblewrap user namespaces with the owned temporary AppArmor profile')
     except Exception as error:
         report = {'status': 'FAIL', 'error': str(error)}

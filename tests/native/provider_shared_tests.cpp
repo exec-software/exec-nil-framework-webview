@@ -1,8 +1,10 @@
 // Copyright (C) 2026 Execute Software. SPDX-License-Identifier: MIT
 #include "provider_shared.hpp"
+#include "win32_navigation.hpp"
 #include <cstdlib>
 #include <iostream>
 #include <thread>
+#include <utility>
 
 using namespace nilwebview;
 namespace {
@@ -38,6 +40,23 @@ int main(int argc, char **argv) {
                   << json_string(evaluation_script("/*NILWEBVIEW_BODY*/")) << "}\n";
         return 0;
     }
+    const std::string html_prefix = "data:text/html;charset=utf-8;base64,";
+    const std::pair<std::string, std::string> html_vectors[] = {
+        {"", ""}, {"f", "Zg=="}, {"fo", "Zm8="}, {"foo", "Zm9v"},
+        {"foob", "Zm9vYg=="}, {"fooba", "Zm9vYmE="}, {"foobar", "Zm9vYmFy"},
+        {"\xCE\xBB", "zrs="}, {"<p>\xCE\xBB</p>", "PHA+zrs8L3A+"},
+        {"\xF0\x9F\x98\x80", "8J+YgA=="},
+    };
+    for (const auto &[html, encoded] : html_vectors)
+        check(win32::html_navigation_uri(html) == html_prefix + encoded, "owned HTML exact navigation URI");
+    const auto largest_html_uri = win32::html_navigation_uri(std::string(NILWV_MAX_TEXT_BYTES, 'x'));
+    check(largest_html_uri.size() == html_prefix.size() + ((NILWV_MAX_TEXT_BYTES + 2) / 3) * 4 &&
+          largest_html_uri.compare(0, html_prefix.size(), html_prefix) == 0 &&
+          largest_html_uri.substr(largest_html_uri.size() - 4) == "eA==", "owned HTML navigation size boundary");
+    bool html_overflow_rejected = false;
+    try { win32::html_navigation_uri(std::string(NILWV_MAX_TEXT_BYTES + 1, 'x')); }
+    catch (const std::length_error &) { html_overflow_rejected = true; }
+    check(html_overflow_rejected, "owned HTML navigation overflow rejected");
     for (const auto &value : {"", "plain", "λ", "😀"}) check(utf8(value), "UTF-8 accepted");
     for (const auto &value : {std::string("x\0y", 3), std::string("\xc0\x80", 2), std::string("\xed\xa0\x80", 3),
                               std::string("\xf4\x90\x80\x80", 4), std::string("\xc2", 1)}) check(!utf8(value), "UTF-8 rejected");

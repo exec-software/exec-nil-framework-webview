@@ -30,7 +30,7 @@ from process_support import require, run
 REPO = Path(__file__).resolve().parents[1]
 DESKTOP_CASES = (
     "configuration", "ready-show", "http-document", "message-immediate",
-    "message-deferred", "message-provenance", "html-json-unicode-depth",
+    "message-deferred", "message-provenance", "same-document-navigation", "html-json-unicode-depth",
     "undefined-null", "script-exception", "script-serialization", "script-async-result",
     "operation-busy", "redirect-explicit-follow", "http-error-document",
     "cross-window-routing", "close-stale-copied-events",

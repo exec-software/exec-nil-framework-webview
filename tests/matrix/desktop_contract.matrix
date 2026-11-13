@@ -221,6 +221,18 @@ main returns number begin paragraph
     evaluate expect-provenance with deferred, capabilities, (base plus "/page"), origin
     evaluate mark with "message-provenance"
 
+    evaluate expect-json with surface, "return window.nilwebviewFragmentMarker = 71;", "71", deadline
+    value fragment-operation is require-ok of Operation, text with (navigate with surface, (base plus "/page#section")), "same-document fragment navigation"
+    evaluate expect-navigation with surface, fragment-operation, deadline
+    evaluate expect-json with surface, "return location.hash;", (quote plus "#section" plus quote), deadline
+    evaluate expect-json with surface, "return window.nilwebviewFragmentMarker;", "71", deadline
+    evaluate expect-json with surface, "return document.getElementById('marker').textContent;", (quote plus "http-ready-λ" plus quote), deadline
+    value repeated-fragment is require-ok of Operation, text with (navigate with surface, (base plus "/page#section")), "repeat same-document fragment navigation"
+    evaluate expect-navigation with surface, repeated-fragment, deadline
+    evaluate expect-json with surface, "return location.hash;", (quote plus "#section" plus quote), deadline
+    evaluate expect-json with surface, "return window.nilwebviewFragmentMarker;", "71", deadline
+    evaluate mark with "same-document-navigation"
+
     value html-operation is require-ok of Operation, text with (load-html with surface,
         "<!doctype html><meta charset=utf-8><title>Matrix λ</title><div id=marker>embedded λ</div>"), "HTML load"
     evaluate expect-navigation with surface, html-operation, deadline

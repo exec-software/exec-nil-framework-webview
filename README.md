@@ -48,9 +48,11 @@ alone is not proof of origin. Applications that require origin or frame checks
 must reject messages when the required native metadata is unavailable.
 
 Navigation accepts HTTP, HTTPS and `about:blank`. Each explicit call authorizes
-one initial request. Redirects and uninitiated navigation are cancelled and
+one initial request. Redirects and uninitiated document loads are cancelled and
 reported as `NavigationRequested`; the application may validate the requested
 destination and explicitly navigate after the previous operation completes.
+Same-document fragment and history changes may update the current URL without
+loading another document; they do not grant permission to load a new page.
 
 ## Build and try the example
 

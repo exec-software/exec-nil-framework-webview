@@ -1,6 +1,7 @@
 // Copyright (C) 2026 Execute Software. SPDX-License-Identifier: MIT
 // WebView2 runs on the creating UI STA. Callbacks never enter Matrix/the VM.
 #include "provider_shared.hpp"
+#include "win32_navigation.hpp"
 #include <windows.h>
 #include <urlmon.h>
 #include <wrl.h>
@@ -177,6 +178,7 @@ struct WinWindow final : Window {
     ComPtr<ICoreWebView2_21> modern;
     std::shared_ptr<Profile> profile;
     ComPtr<IUri> requested_uri;
+    std::wstring requested_html_uri;
     std::wstring script_id;
     std::string runtime_detail;
     std::uint64_t navigation_id = 0;
@@ -184,6 +186,8 @@ struct WinWindow final : Window {
     bool bootstrap = true;
     bool admit_request = false;
     bool policy_cancelled = false;
+    bool fragment_request = false;
+    bool fragment_repeat = false;
 };
 struct WinContext final : Context {
     bool com_initialized = false;
@@ -209,6 +213,9 @@ void dispose(const std::shared_ptr<WinWindow> &value) noexcept {
     if (value->controller) value->controller->Close();
     value->modern.Reset(); value->view.Reset(); value->controller.Reset(); value->environment.Reset();
     value->requested_uri.Reset();
+    value->requested_html_uri.clear();
+    value->fragment_request = false;
+    value->fragment_repeat = false;
     if (value->handle) { DestroyWindow(value->handle); value->handle = nullptr; }
     if (value->profile) value->profile->retired = true;
     value->profile.reset();
@@ -336,10 +343,56 @@ HWND create_window(WinWindow &value, const std::wstring &title, int width, int h
         CW_USEDEFAULT, CW_USEDEFAULT, bounds.right - bounds.left, bounds.bottom - bounds.top,
         nullptr, nullptr, module, &value.binding);
 }
+bool canonical_uri(IUri *uri, std::wstring &output) {
+    struct AbsoluteUri {
+        BSTR value = nullptr;
+        ~AbsoluteUri() { SysFreeString(value); }
+    } absolute;
+    if (!uri || FAILED(uri->GetAbsoluteUri(&absolute.value)) || !absolute.value ||
+        SysStringLen(absolute.value) > NILWV_MAX_TEXT_BYTES) return false;
+    output.assign(absolute.value, SysStringLen(absolute.value));
+    return true;
+}
+bool parse_native_uri(LPCWSTR text, ComPtr<IUri> &uri) {
+    if (!text) return false;
+    std::size_t length = 0;
+    while (length <= NILWV_MAX_TEXT_BYTES && text[length]) ++length;
+    return length <= NILWV_MAX_TEXT_BYTES && SUCCEEDED(CreateUri(text, Uri_CREATE_CANONICALIZE, 0, &uri));
+}
 bool same_uri(IUri *expected, LPCWSTR text) {
-    ComPtr<IUri> actual; BOOL equal = FALSE;
-    return expected && SUCCEEDED(CreateUri(text, Uri_CREATE_CANONICALIZE, 0, &actual)) &&
-        SUCCEEDED(expected->IsEqual(actual.Get(), &equal)) && equal;
+    ComPtr<IUri> actual;
+    std::wstring requested, observed;
+    // IUri::IsEqual is case-insensitive. Compare canonical strings instead so
+    // HTTP paths and fragments retain their case-sensitive identity.
+    return parse_native_uri(text, actual) &&
+        canonical_uri(expected, requested) && canonical_uri(actual.Get(), observed) && requested == observed;
+}
+bool fragment_only(IUri *requested, LPCWSTR source, bool &repeat) {
+    repeat = false;
+    ComPtr<IUri> current;
+    std::wstring old_uri, new_uri;
+    if (!parse_native_uri(source, current) ||
+        !canonical_uri(current.Get(), old_uri) || !canonical_uri(requested, new_uri)) return false;
+    if (new_uri.find(L'#') == std::wstring::npos ||
+        old_uri.substr(0, old_uri.find(L'#')) != new_uri.substr(0, new_uri.find(L'#'))) return false;
+    repeat = old_uri == new_uri;
+    return true;
+}
+bool pending_fragment(const std::shared_ptr<WinWindow> &value) {
+    return !value->bootstrap && value->ready && !value->closed && !value->failed && value->fragment_request &&
+        value->admit_request && !value->navigation_id && value->navigation_operation > 0 &&
+        value->operation_kind == Operation::navigation && value->operation == value->navigation_operation;
+}
+void finish_fragment(WinContext &state, const std::shared_ptr<WinWindow> &value, LPCWSTR source) {
+    if (!state.live(value) || !pending_fragment(value) || !same_uri(value->requested_uri.Get(), source)) return;
+    std::string url;
+    if (!narrow(source, url)) {
+        state.provider_failed(value, "WebView2 fragment URI exceeds text contract"); return;
+    }
+    const auto operation = value->navigation_operation;
+    value->admit_request = false; value->fragment_request = false; value->fragment_repeat = false;
+    value->navigation_operation = 0;
+    state.navigation_finished(value, operation, true, url, "");
 }
 bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shared_ptr<WinWindow> &window) {
     const std::weak_ptr<WinContext> weak_context = context;
@@ -360,24 +413,43 @@ bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shar
                 // remains cancelled; only our subsequent NavigateToString is
                 // authorized. Do not expose an unrecoverable navigation event
                 // before the consumer has received Ready.
+                if (value->bootstrap && !redirected && uri.value && !wcscmp(uri.value, L"about:blank")) return;
                 if (value->bootstrap && !value->admit_request) {
-                    if (!redirected && uri.value && !wcscmp(uri.value, L"about:blank")) return;
                     fail_initialization(state, value, "WebView2 requested an unexpected navigation before initialization");
                     return;
                 }
-                if (value->admit_request && !redirected && same_uri(value->requested_uri.Get(), uri.value)) {
+                const bool requested = value->admit_request && !redirected &&
+                    (value->requested_html_uri.empty() ? same_uri(value->requested_uri.Get(), uri.value) :
+                     uri.value && !wcsncmp(uri.value, value->requested_html_uri.c_str(), value->requested_html_uri.size() + 1));
+                if (value->admit_request && !redirected && requested) {
                     value->admit_request = false; value->navigation_id = id;
+                    value->requested_html_uri.clear();
                     if (FAILED(args->put_Cancel(FALSE))) state.provider_failed(value, "WebView2 cannot authorize navigation");
                     return;
                 }
                 if (value->bootstrap) {
-                    fail_initialization(state, value, "WebView2 initial document did not match the authorized about:blank navigation");
+                    fail_initialization(state, value, "WebView2 initial document did not match its authorized HTML content");
                     return;
                 }
                 if (id == value->navigation_id) value->policy_cancelled = true;
                 std::string url;
                 if (!narrow(uri.value, url)) { state.provider_failed(value, "WebView2 requested URI exceeds text contract"); return; }
                 state.navigation_requested(value, url);
+            });
+            return S_OK;
+        }).Get(), &token);
+    if (FAILED(result)) return false;
+    result = window->view->add_SourceChanged(Callback<ICoreWebView2SourceChangedEventHandler>(
+        [weak_context, weak_window](ICoreWebView2 *sender, ICoreWebView2SourceChangedEventArgs *args) -> HRESULT {
+            callback(weak_context, weak_window, [&](auto &state, const auto &value) {
+                if (!pending_fragment(value)) return;
+                BOOL new_document = TRUE;
+                WideText raw;
+                if (!args || FAILED(args->get_IsNewDocument(&new_document)) ||
+                    !sender || FAILED(sender->get_Source(&raw.value))) {
+                    state.provider_failed(value, "WebView2 fragment navigation metadata unavailable"); return;
+                }
+                if (!new_document) finish_fragment(state, value, raw.value);
             });
             return S_OK;
         }).Get(), &token);
@@ -407,6 +479,8 @@ bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shar
                 }
                 if (value->failed || id != value->navigation_id) return;
                 value->admit_request = false; value->navigation_id = 0;
+                value->fragment_request = false;
+                value->fragment_repeat = false;
                 if (value->bootstrap) {
                     value->bootstrap = false;
                     if (okay) state.initialized(value, value->runtime_detail);
@@ -527,6 +601,7 @@ void initialize_controller(const std::shared_ptr<WinContext> &context, const std
                     if (window->failed) return;
                     if (FAILED(error) || !id) { fail_initialization(state, window, "WebView2 message helper registration failed"); return; }
                     window->script_id = id;
+                    window->requested_html_uri = wide(html_navigation_uri("<!doctype html><html></html>"));
                     window->admit_request = true;
                     if (FAILED(CreateUri(L"about:blank", Uri_CREATE_CANONICALIZE, 0, &window->requested_uri)) ||
                         FAILED(window->view->NavigateToString(L"<!doctype html><html></html>")))
@@ -694,11 +769,24 @@ void navigate_common(nilwv_context_v1 *context, std::int64_t id, nilwv_text_v1 i
         if ((!html && !navigation_uri(data)) || FAILED(CreateUri(html ? L"about:blank" : text.c_str(), Uri_CREATE_CANONICALIZE, 0, &uri))) {
             state.fail(out, NILWV_E_ARGUMENT, "WebView navigation requires an HTTP(S) URI or about:blank"); return;
         }
+        auto html_uri = html ? wide(html_navigation_uri(data)) : std::wstring{};
+        bool fragment = false, repeat = false;
+        if (!html) {
+            WideText current;
+            if (SUCCEEDED(value->view->get_Source(&current.value))) fragment = fragment_only(uri.Get(), current.value, repeat);
+        }
         const auto operation = state.start(value, Operation::navigation, out); if (!operation) return;
         value->admit_request = true; value->policy_cancelled = false; value->navigation_id = 0;
         value->requested_uri = uri; value->navigation_operation = operation;
+        value->requested_html_uri = std::move(html_uri);
+        value->fragment_request = fragment; value->fragment_repeat = repeat;
         const HRESULT result = html ? value->view->NavigateToString(text.c_str()) : value->view->Navigate(text.c_str());
-        if (FAILED(result)) { value->admit_request = false; value->navigation_operation = 0; state.reject(value, operation, out, "WebView2 rejected the navigation"); }
+        if (FAILED(result)) {
+            value->admit_request = false; value->fragment_request = false; value->fragment_repeat = false;
+            value->navigation_operation = 0;
+            value->requested_html_uri.clear();
+            state.reject(value, operation, out, "WebView2 rejected the navigation");
+        }
     });
 }
 void navigate(nilwv_context_v1 *context, std::int64_t id, nilwv_text_v1 text, nilwv_result_v1 *out) noexcept { navigate_common(context, id, text, out, false); }
@@ -747,6 +835,16 @@ void poll(nilwv_context_v1 *context, std::int64_t id, nilwv_result_v1 *out) noex
             if (!PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) break;
             if (message.message == WM_QUIT) { PostQuitMessage(static_cast<int>(message.wParam)); break; }
             TranslateMessage(&message); DispatchMessageW(&message);
+        }
+        // Repeating an already-current fragment has no SourceChanged event.
+        // After pumping the STA, verify the explicitly requested native Source;
+        // this shortcut cannot complete an ordinary same-URL document reload.
+        for (const auto &weak : state.native_windows) if (auto value = weak.lock(); value &&
+            value->fragment_repeat && pending_fragment(value) && value->view) {
+            WideText current;
+            if (FAILED(value->view->get_Source(&current.value)))
+                state.provider_failed(value, "WebView2 repeated fragment source unavailable");
+            else finish_fragment(state, value, current.value);
         }
         state.expire_operations();
         for (const auto &weak : state.native_windows) if (auto value = weak.lock(); value && value->failed) {

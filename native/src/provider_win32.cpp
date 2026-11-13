@@ -271,6 +271,9 @@ template<class F> void callback(const std::weak_ptr<WinContext> &weak_context,
 }
 void dispose(const std::shared_ptr<WinWindow> &value) noexcept {
     if (!value) return;
+    // Close/DestroyWindow may synchronously complete an aborted initialization.
+    // Publish retirement first so that callback can drain its private environment.
+    if (value->profile) value->profile->retired = true;
     value->admit_request = false;
     // All registered handlers capture weak state only. Close releases the
     // controller's handlers; pending completions remain independently safe.
@@ -281,7 +284,6 @@ void dispose(const std::shared_ptr<WinWindow> &value) noexcept {
     value->requested_html_uri.clear();
     value->fragment_request = false;
     if (value->handle) { DestroyWindow(value->handle); value->handle = nullptr; }
-    if (value->profile) value->profile->retired = true;
     value->profile.reset();
 }
 

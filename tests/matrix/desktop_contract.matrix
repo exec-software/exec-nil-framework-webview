@@ -23,7 +23,7 @@ next-event receives surface as Window, deadline as number returns Event begin pa
     evaluate panic with "desktop event deadline expired"
 end paragraph
 
-expect-ready receives surface as Window, deadline as number begin paragraph
+expect-ready receives surface as Window, deadline as number, host as text begin paragraph
     value ready is next-event with surface, deadline
     expect ready.window.handle equals surface.handle
     expect ready.sequence is greater than 0
@@ -35,6 +35,10 @@ expect-ready receives surface as Window, deadline as number begin paragraph
         when Option.None then expect yes
         when _ then expect no
     end consider
+    when host equals "Windows" then
+        expect (the length of ready.detail) is greater than 0
+        say "webview-desktop-runtime:" plus ready.detail
+    end when
 end paragraph
 
 expect-operation receives notification as Event, operation as Operation begin paragraph
@@ -192,7 +196,7 @@ main returns number begin paragraph
     evaluate mark with "configuration"
 
     value surface is require-ok of Window, text with (create-window with "NIL WebView desktop λ", 640, 480), "create hidden window"
-    evaluate expect-ready with surface, deadline
+    evaluate expect-ready with surface, deadline, host
     expect require-ok of boolean, text with (show-window with surface), "show window"
     evaluate mark with "ready-show"
 
@@ -305,7 +309,7 @@ main returns number begin paragraph
 
     value second is require-ok of Window, text with (create-window with "NIL second owned window", 320, 240), "second window"
     expect second.handle does not equal surface.handle
-    evaluate expect-ready with second, deadline
+    evaluate expect-ready with second, deadline, host
     value second-operation is require-ok of Operation, text with (evaluate-function with second, "return 99;"), "second script"
     value first-quiet is require-ok of PendingEvent, text with (poll-event with surface), "first-window poll"
     consider first-quiet
@@ -322,7 +326,7 @@ main returns number begin paragraph
 
     value third is require-ok of Window, text with (create-window with "NIL replacement owned window", 320, 240), "replacement window"
     expect third.handle does not equal second.handle
-    evaluate expect-ready with third, deadline
+    evaluate expect-ready with third, deadline, host
     expect require-ok of boolean, text with (close-window with third), "close replacement window"
     !!! Close immediately after creation without pumping or waiting for Ready.
     !!! Initialization may finish at any time; stale handles must still fail,

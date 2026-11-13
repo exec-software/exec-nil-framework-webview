@@ -61,9 +61,10 @@ int main(int argc, char **argv) {
     Context context, other; auto out = result(); auto pending = add(context, false);
     check(!context.window(pending->id, &out) && out.code == NILWV_E_NOT_READY, "pending window not ready");
     check(!other.window(pending->id, &out) && out.code == NILWV_E_HANDLE, "foreign window rejected");
-    context.initialized(pending); context.initialized(pending);
+    std::string ready_detail = "owned runtime identity";
+    context.initialized(pending, ready_detail); ready_detail.clear(); context.initialized(pending, "duplicate");
     const auto ready = event(context, pending->id);
-    check(number(context, ready, "kind") == NILWV_EVENT_READY, "ready event");
+    check(number(context, ready, "kind") == NILWV_EVENT_READY && text(context, ready, "detail") == "owned runtime identity", "ready event owns its diagnostic");
     check(number(context, ready, "window") == pending->id, "ready window identity");
     context.poll(pending->id, &out); check(out.code == 0 && out.number == 0, "no duplicate ready");
     other.event_number(ready, "kind", &out); check(out.code == NILWV_E_HANDLE, "foreign snapshot rejected");

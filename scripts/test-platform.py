@@ -218,7 +218,7 @@ class HTTPFixture:
         return report
 
 
-def verify_output(text: str, profile: str) -> dict:
+def verify_output(text: str, profile: str, system: str | None = None) -> dict:
     lines = text.splitlines()
     if profile == "synthetic":
         require(lines == ["webview-matrix-contract-ok"], "synthetic route sentinel differs or includes a skip")
@@ -230,9 +230,18 @@ def verify_output(text: str, profile: str) -> dict:
             re.fullmatch(r"webview-desktop-order:immediate:(?:message-first|completion-first)", orders[0]) and
             re.fullmatch(r"webview-desktop-order:deferred:(?:message-first|completion-first)", orders[1]),
             "desktop paired-event order inventory differs")
-    require(lines[-1:] == ["webview-desktop-contract-ok"] and len(lines) == len(DESKTOP_CASES) + 3,
+    runtimes = [line.removeprefix("webview-desktop-runtime:") for line in lines
+                if line.startswith("webview-desktop-runtime:")]
+    if (system or platform.system()) == "Windows":
+        require(len(runtimes) == 3 and all(len(value) <= 136 and
+                re.fullmatch(r"WebView2 [0-9]+(?:\.[0-9]+){3}(?: (?:beta|dev|canary))?", value)
+                for value in runtimes), "actual WebView2 environment versions are missing or malformed")
+    else:
+        require(not runtimes, "unexpected WebView2 environment version on this host")
+    require(lines[-1:] == ["webview-desktop-contract-ok"] and len(lines) == len(DESKTOP_CASES) + 3 + len(runtimes),
             "desktop route emitted unexpected output or omitted completion")
-    return {"checks": len(cases), "cases": cases, "observed_event_order": orders}
+    return {"checks": len(cases), "cases": cases, "observed_event_order": orders,
+            "browser_runtime_versions": runtimes}
 
 
 def route_environment(env: dict[str, str], work: Path, label: str,

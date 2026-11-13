@@ -83,7 +83,7 @@ public:
 
     std::int64_t start(const std::shared_ptr<Window> &, Operation, nilwv_result_v1 *);
     void reject(const std::shared_ptr<Window> &, std::int64_t, nilwv_result_v1 *, const std::string &);
-    void initialized(const std::shared_ptr<Window> &);
+    void initialized(const std::shared_ptr<Window> &, const std::string &detail = {});
     void initialization_failed(const std::shared_ptr<Window> &, const std::string &);
     void navigation_finished(const std::shared_ptr<Window> &, std::int64_t,
                              bool okay, const std::string &url, const std::string &detail = {},

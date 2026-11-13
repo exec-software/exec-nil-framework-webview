@@ -19,6 +19,31 @@ DRIVER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(DRIVER)
 
 
+class RuntimeEvidenceControls(unittest.TestCase):
+    def output(self, runtimes=()):
+        lines = ['webview-desktop-case:' + case for case in DRIVER.DESKTOP_CASES]
+        lines += ['webview-desktop-order:immediate:message-first',
+                  'webview-desktop-order:deferred:completion-first']
+        lines += ['webview-desktop-runtime:' + value for value in runtimes]
+        return '\n'.join(lines + ['webview-desktop-contract-ok']) + '\n'
+
+    def test_windows_requires_actual_environment_versions(self):
+        versions = ['WebView2 142.0.3595.90', 'WebView2 143.0.3000.2 beta', 'WebView2 144.0.3000.1 dev']
+        report = DRIVER.verify_output(self.output(versions), 'desktop', 'Windows')
+        self.assertEqual(report['browser_runtime_versions'], versions)
+        for invalid in ([], versions[:2], versions + versions[:1], ['WebView2 SDK 1.0.4314.35'] * 3,
+                        ['WebView2 unknown'] * 3, ['WebView2 142.0.3000.2\nextra'] * 3):
+            with self.subTest(invalid=invalid), self.assertRaises(AssertionError):
+                DRIVER.verify_output(self.output(invalid), 'desktop', 'Windows')
+
+    def test_other_hosts_preserve_exact_output_contract(self):
+        for system in ('Linux', 'Darwin'):
+            report = DRIVER.verify_output(self.output(), 'desktop', system)
+            self.assertEqual(report['browser_runtime_versions'], [])
+            with self.assertRaises(AssertionError):
+                DRIVER.verify_output(self.output(['WebView2 142.0.3000.2'] * 3), 'desktop', system)
+
+
 class ProfileControls(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix='nilwebview-harness-control-')

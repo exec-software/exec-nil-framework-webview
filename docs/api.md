@@ -79,6 +79,11 @@ Failure kinds are `None`, `Native`, `ScriptException`, `Serialization`,
 `AsyncResult`, `PayloadLimit`, `Timeout` and `Cancelled`. Native diagnostic
 wording may differ by platform.
 
+On Windows, `Ready.detail` includes `WebView2 ` followed by the browser version
+reported by that window's actual environment. It identifies the runtime used
+by the window, independently of the SDK/loader version used at build time.
+Treat it as a diagnostic; it does not replace capability checks.
+
 `poll-event` copies every event field and releases the runtime snapshot on both
 success and error paths. Applications do not call native snapshot-release APIs.
 The pump processes at most 64 native dispatch iterations with a 2 ms soft

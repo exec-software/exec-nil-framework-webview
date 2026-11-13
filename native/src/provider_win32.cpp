@@ -178,6 +178,7 @@ struct WinWindow final : Window {
     std::shared_ptr<Profile> profile;
     ComPtr<IUri> requested_uri;
     std::wstring script_id;
+    std::string runtime_detail;
     std::uint64_t navigation_id = 0;
     std::int64_t navigation_operation = 0;
     bool bootstrap = true;
@@ -388,7 +389,7 @@ bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shar
                 value->admit_request = false; value->navigation_id = 0;
                 if (value->bootstrap) {
                     value->bootstrap = false;
-                    if (okay) state.initialized(value);
+                    if (okay) state.initialized(value, value->runtime_detail);
                     else fail_initialization(state, value, "WebView2 initial document failed");
                     return;
                 }
@@ -597,6 +598,15 @@ void window(nilwv_context_v1 *context, nilwv_text_v1 title, std::int64_t width, 
                         if (!observed) {
                             fail_initialization(owner, live_window, "WebView2 browser resource lifetime observation unavailable"); return;
                         }
+                        WideText runtime_version;
+                        std::string version;
+                        if (FAILED(environment->get_BrowserVersionString(&runtime_version.value)) ||
+                            !runtime_version.value || !narrow(runtime_version.value, version, 128) || version.empty()) {
+                            fail_initialization(owner, live_window, "WebView2 environment runtime version unavailable"); return;
+                        }
+                        // Actual environment identity, independent of the SDK
+                        // loader version and probe's available-runtime check.
+                        live_window->runtime_detail = "WebView2 " + version;
                         live_window->environment = environment;
                         const auto controller_completion = std::make_shared<Completion>(profile);
                         const bool browser_already_started = profile->await_browser_exit;

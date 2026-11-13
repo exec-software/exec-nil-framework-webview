@@ -71,13 +71,18 @@ An `Event` contains these fields:
 | `NavigationCompleted` / `NavigationFailed` | Completion of a host navigation; URI payloads are JSON strings, not sender provenance. |
 | `ScriptCompleted` / `ScriptFailed` | Evaluation result or failure for the matching operation. |
 | `PageMessage` | Serialized page JSON plus available native sender metadata. |
-| `NavigationRequested` | Cancelled navigation destination as a JSON string; the application decides whether to follow. |
+| `NavigationRequested` | Cancelled document-navigation destination as a JSON string; the application decides whether to follow. |
 | `CloseRequested` | Native/page close request; application calls `close-window`. |
 | `ProviderFailed` | Browser failure; close the affected window. |
 
 Failure kinds are `None`, `Native`, `ScriptException`, `Serialization`,
 `AsyncResult`, `PayloadLimit`, `Timeout` and `Cancelled`. Native diagnostic
 wording may differ by platform.
+
+On Windows, `Ready.detail` includes `WebView2 ` followed by the browser version
+reported by that window's actual environment. It identifies the runtime used
+by the window, independently of the SDK/loader version used at build time.
+Treat it as a diagnostic; it does not replace capability checks.
 
 `poll-event` copies every event field and releases the runtime snapshot on both
 success and error paths. Applications do not call native snapshot-release APIs.
@@ -115,12 +120,22 @@ data. Never concatenate untrusted messages into evaluated JavaScript.
 ## Navigation policy
 
 Only an explicit `navigate` authorizes an initial URL request. Redirects,
-page-initiated navigation and new-window requests are cancelled and reported
+page-initiated document loads and new-window requests are cancelled and reported
 as `NavigationRequested`. If an active navigation was cancelled, it completes
 with `NavigationFailed` and `FailureKind.Cancelled`. Wait for that completion,
 decode the requested JSON string, apply the application's destination policy,
 then start a new `navigate` if approved. Do not automatically follow every
 request. This policy is common to all initial providers.
+
+Host fragment navigation within the current document still has an operation
+identity and completion, and preserves that document. Requesting the exact
+current URL including its fragment is idempotent: it completes without
+reloading or dispatching another native navigation. A same-URL request without
+a fragment continues to use ordinary native navigation/reload behavior.
+A page may also change its same-document fragment or
+history URL state without loading a new document. Such URL changes are not a
+cancellable document-load request and do not authorize a later document load.
+The navigation policy is not a lock on the page's exact current URL.
 
 `load-html` supplies no base URI. Relative assets, filesystem navigation,
 downloads and browser-managed popups are outside the initial profile. JavaScript

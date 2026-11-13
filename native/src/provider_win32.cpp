@@ -1,6 +1,7 @@
 // Copyright (C) 2026 Execute Software. SPDX-License-Identifier: MIT
 // WebView2 runs on the creating UI STA. Callbacks never enter Matrix/the VM.
 #include "provider_shared.hpp"
+#include "win32_navigation.hpp"
 #include <windows.h>
 #include <urlmon.h>
 #include <wrl.h>
@@ -59,6 +60,13 @@ struct Profile {
     bool await_browser_exit = false;
     bool browser_resources_released = false;
     bool retired = false;
+    bool cleanup_controller_requested = false;
+    bool cleanup_controller_failed = false;
+    bool controller_requested = false;
+    HRESULT environment_status = E_PENDING;
+    HRESULT monitor_status = E_PENDING;
+    HRESULT process_status = E_PENDING;
+    HRESULT controller_status = E_PENDING;
 
     void release_monitor() noexcept {
         if (exit_registered && exit_environment)
@@ -120,38 +128,97 @@ bool remove_owned_tree(const std::wstring &path, Clock::time_point until, unsign
 }
 bool observe_browser_exit(const std::shared_ptr<Profile> &profile, ICoreWebView2Environment *environment) noexcept {
     try {
-        if (FAILED(environment->QueryInterface(IID_PPV_ARGS(&profile->exit_environment)))) return false;
+        profile->monitor_status = environment->QueryInterface(IID_PPV_ARGS(&profile->exit_environment));
+        if (FAILED(profile->monitor_status)) return false;
         const std::weak_ptr<Profile> weak_profile = profile;
-        const auto result = profile->exit_environment->add_BrowserProcessExited(
+        profile->monitor_status = profile->exit_environment->add_BrowserProcessExited(
             Callback<ICoreWebView2BrowserProcessExitedEventHandler>(
                 [weak_profile](ICoreWebView2Environment *, ICoreWebView2BrowserProcessExitedEventArgs *) -> HRESULT {
                     if (auto value = weak_profile.lock()) value->browser_resources_released = true;
                     return S_OK;
                 }).Get(), &profile->exit_token);
-        profile->exit_registered = SUCCEEDED(result);
+        profile->exit_registered = SUCCEEDED(profile->monitor_status);
         if (!profile->exit_registered) return false;
+        profile->await_browser_exit = true;
 
         // A context can be closed while environment creation is pending. Even
         // without a retained controller, inspect only this environment's own
         // process collection and keep an exact handle if its browser started.
+        // This early snapshot is optional: controller completion captures the
+        // mandatory handle before Close. Its absence must neither bypass the
+        // exit event nor prevent a retired environment from reaching Close.
         ComPtr<ICoreWebView2Environment8> process_environment;
         ComPtr<ICoreWebView2ProcessInfoCollection> processes;
         UINT count = 0;
-        if (FAILED(environment->QueryInterface(IID_PPV_ARGS(&process_environment))) ||
-            FAILED(process_environment->GetProcessInfos(&processes)) ||
-            FAILED(processes->get_Count(&count)) || count > 128) return false;
-        profile->await_browser_exit = count != 0;
+        profile->process_status = environment->QueryInterface(IID_PPV_ARGS(&process_environment));
+        if (FAILED(profile->process_status)) return true;
+        profile->process_status = process_environment->GetProcessInfos(&processes);
+        if (FAILED(profile->process_status)) return true;
+        if (!processes) { profile->process_status = E_POINTER; return true; }
+        profile->process_status = processes->get_Count(&count);
+        if (FAILED(profile->process_status)) return true;
+        if (count > 128) { profile->process_status = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER); return true; }
         for (UINT index = 0; index < count; ++index) {
             ComPtr<ICoreWebView2ProcessInfo> info;
             COREWEBVIEW2_PROCESS_KIND kind{};
             INT32 pid = 0;
-            if (FAILED(processes->GetValueAtIndex(index, &info)) ||
-                FAILED(info->get_Kind(&kind)) || FAILED(info->get_ProcessId(&pid))) return false;
-            if (kind == COREWEBVIEW2_PROCESS_KIND_BROWSER && pid > 0 && !profile->browser)
+            profile->process_status = processes->GetValueAtIndex(index, &info);
+            if (FAILED(profile->process_status)) return true;
+            if (!info) { profile->process_status = E_POINTER; return true; }
+            profile->process_status = info->get_Kind(&kind);
+            if (FAILED(profile->process_status)) return true;
+            profile->process_status = info->get_ProcessId(&pid);
+            if (FAILED(profile->process_status)) return true;
+            if (kind == COREWEBVIEW2_PROCESS_KIND_BROWSER && pid > 0 && !profile->browser) {
                 profile->browser = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
+                if (!profile->browser) { profile->process_status = HRESULT_FROM_WIN32(GetLastError()); return true; }
+            }
         }
         return true;
-    } catch (...) { return false; }
+    } catch (...) {
+        if (profile->exit_registered) profile->process_status = E_UNEXPECTED;
+        else profile->monitor_status = E_UNEXPECTED;
+        return profile->exit_registered;
+    }
+}
+bool private_environment(const std::shared_ptr<Profile> &profile, ICoreWebView2Environment *environment) {
+    ComPtr<ICoreWebView2Environment7> identified;
+    WideText actual;
+    return environment && SUCCEEDED(environment->QueryInterface(IID_PPV_ARGS(&identified))) &&
+        SUCCEEDED(identified->get_UserDataFolder(&actual.value)) && actual.value &&
+        _wcsicmp(actual.value, profile->directory.c_str()) == 0;
+}
+void close_unretained_controller(const std::shared_ptr<Profile> &profile, ICoreWebView2Controller *controller) noexcept {
+    ComPtr<ICoreWebView2> view; UINT32 pid = 0;
+    if (FAILED(controller->get_CoreWebView2(&view)) || !view ||
+        FAILED(view->get_BrowserProcessId(&pid)) || !pid ||
+        (profile->browser && GetProcessId(profile->browser) != pid) ||
+        (!profile->browser && !(profile->browser = OpenProcess(
+            SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid))))
+        profile->cleanup_controller_failed = true;
+    if (FAILED(controller->Close())) profile->cleanup_controller_failed = true;
+}
+void close_retired_environment(const std::shared_ptr<Profile> &profile, ICoreWebView2Environment *environment) noexcept {
+    if (profile->cleanup_controller_requested) return;
+    profile->cleanup_controller_requested = true;
+    profile->await_browser_exit = true;
+    profile->browser_resources_released = false;
+    try {
+        if (!private_environment(profile, environment)) { profile->cleanup_controller_failed = true; return; }
+        const auto completion = std::make_shared<Completion>(profile);
+        // An environment completed after its window closed may never have had
+        // a controller to Close. Finish that native lifecycle invisibly, so the
+        // same BrowserProcessExited/resource-release gate can still be used.
+        const auto result = environment->CreateCoreWebView2Controller(HWND_MESSAGE,
+            Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                [profile, completion](HRESULT error, ICoreWebView2Controller *controller) -> HRESULT {
+                    const FinishCompletion finished{completion};
+                    if (FAILED(error) || !controller) profile->cleanup_controller_failed = true;
+                    if (controller) close_unretained_controller(profile, controller);
+                    return S_OK;
+                }).Get());
+        if (FAILED(result)) { completion->finish(); profile->cleanup_controller_failed = true; }
+    } catch (...) { profile->cleanup_controller_failed = true; }
 }
 std::shared_ptr<Profile> create_profile() {
     wchar_t parent[32768]{};
@@ -174,15 +241,19 @@ struct WinWindow final : Window {
     ComPtr<ICoreWebView2Environment> environment;
     ComPtr<ICoreWebView2Controller> controller;
     ComPtr<ICoreWebView2> view;
-    ComPtr<ICoreWebView2_21> modern;
+    ComPtr<ICoreWebView2_22> modern;
     std::shared_ptr<Profile> profile;
     ComPtr<IUri> requested_uri;
+    std::wstring requested_html_uri;
     std::wstring script_id;
+    std::string runtime_detail;
     std::uint64_t navigation_id = 0;
     std::int64_t navigation_operation = 0;
     bool bootstrap = true;
     bool admit_request = false;
+    bool admit_document_request = false;
     bool policy_cancelled = false;
+    bool fragment_request = false;
 };
 struct WinContext final : Context {
     bool com_initialized = false;
@@ -201,15 +272,20 @@ template<class F> void callback(const std::weak_ptr<WinContext> &weak_context,
 }
 void dispose(const std::shared_ptr<WinWindow> &value) noexcept {
     if (!value) return;
+    // Close/DestroyWindow may synchronously complete an aborted initialization.
+    // Publish retirement first so that callback can drain its private environment.
+    if (value->profile) value->profile->retired = true;
     value->admit_request = false;
+    value->admit_document_request = false;
     // All registered handlers capture weak state only. Close releases the
     // controller's handlers; pending completions remain independently safe.
     if (value->view) value->view->Stop();
     if (value->controller) value->controller->Close();
     value->modern.Reset(); value->view.Reset(); value->controller.Reset(); value->environment.Reset();
     value->requested_uri.Reset();
+    value->requested_html_uri.clear();
+    value->fragment_request = false;
     if (value->handle) { DestroyWindow(value->handle); value->handle = nullptr; }
-    if (value->profile) value->profile->retired = true;
     value->profile.reset();
 }
 
@@ -218,7 +294,7 @@ bool collect_profiles(WinContext &state, Clock::time_point until, unsigned budge
     for (auto &profile : state.profiles) {
         if (!profile) continue;
         complete = false;
-        if (!profile->retired || profile->pending.load(std::memory_order_acquire)) continue;
+        if (!profile->retired || profile->pending.load(std::memory_order_acquire) || profile->cleanup_controller_failed) continue;
         if (profile->await_browser_exit && !profile->browser_resources_released) continue;
         if (profile->browser && WaitForSingleObject(profile->browser, 0) != WAIT_OBJECT_0) continue;
         profile->release_monitor();
@@ -267,8 +343,19 @@ void drain_profiles(WinContext &state) noexcept {
     }
     if (quit_seen) PostQuitMessage(static_cast<int>(quit_code));
     bool retained = false;
-    for (auto &profile : state.profiles) if (profile) {
+    for (unsigned slot = 0; slot < state.profiles.size(); ++slot) {
+        auto &profile = state.profiles[slot];
+        if (!profile) continue;
         retained = true;
+        const DWORD browser_wait = profile->browser ? WaitForSingleObject(profile->browser, 0) : WAIT_FAILED;
+        std::fprintf(stderr, "nilwebview: retained profile slot=%u pending=%u retired=%d awaiting_exit=%d "
+            "resources_released=%d has_browser=%d browser_wait=%lu cleanup_controller=%d cleanup_failed=%d "
+            "controller_requested=%d environment_hr=%ld monitor_hr=%ld process_hr=%ld controller_hr=%ld\n",
+            slot, profile->pending.load(std::memory_order_acquire), profile->retired,
+            profile->await_browser_exit, profile->browser_resources_released, profile->browser != nullptr,
+            static_cast<unsigned long>(browser_wait), profile->cleanup_controller_requested, profile->cleanup_controller_failed,
+            profile->controller_requested, static_cast<long>(profile->environment_status), static_cast<long>(profile->monitor_status),
+            static_cast<long>(profile->process_status), static_cast<long>(profile->controller_status));
         // Break environment/callback ownership on timeout. Late callbacks hold
         // independent cancelled profile state and weak context/window handles.
         profile->release_monitor();
@@ -280,6 +367,9 @@ void drain_profiles(WinContext &state) noexcept {
         std::fflush(stderr);
     }
 }
+void fail_initialization(WinContext &state, const std::shared_ptr<WinWindow> &value, const char *detail) {
+    state.initialization_failed(value, detail); dispose(value);
+}
 LRESULT CALLBACK window_proc(HWND handle, UINT message, WPARAM wparam, LPARAM lparam) noexcept {
     if (message == WM_NCCREATE) {
         auto create = reinterpret_cast<CREATESTRUCTW *>(lparam);
@@ -288,7 +378,10 @@ LRESULT CALLBACK window_proc(HWND handle, UINT message, WPARAM wparam, LPARAM lp
     auto binding = reinterpret_cast<Binding *>(GetWindowLongPtrW(handle, GWLP_USERDATA));
     if (binding) {
         if (message == WM_CLOSE) {
-            callback(binding->context, binding->window, [](auto &state, const auto &value) { state.close_requested(value); });
+            callback(binding->context, binding->window, [](auto &state, const auto &value) {
+                if (value->bootstrap) fail_initialization(state, value, "WebView2 host window closed during initialization");
+                else state.close_requested(value);
+            });
             return 0;
         }
         if (message == WM_SIZE) {
@@ -329,20 +422,120 @@ HWND create_window(WinWindow &value, const std::wstring &title, int width, int h
         CW_USEDEFAULT, CW_USEDEFAULT, bounds.right - bounds.left, bounds.bottom - bounds.top,
         nullptr, nullptr, module, &value.binding);
 }
+bool canonical_uri(IUri *uri, std::wstring &output) {
+    struct AbsoluteUri {
+        BSTR value = nullptr;
+        ~AbsoluteUri() { SysFreeString(value); }
+    } absolute;
+    if (!uri || FAILED(uri->GetAbsoluteUri(&absolute.value)) || !absolute.value ||
+        SysStringLen(absolute.value) > NILWV_MAX_TEXT_BYTES) return false;
+    output.assign(absolute.value, SysStringLen(absolute.value));
+    return true;
+}
+bool parse_native_uri(LPCWSTR text, ComPtr<IUri> &uri) {
+    if (!text) return false;
+    std::size_t length = 0;
+    while (length <= NILWV_MAX_TEXT_BYTES && text[length]) ++length;
+    return length <= NILWV_MAX_TEXT_BYTES && SUCCEEDED(CreateUri(text, Uri_CREATE_CANONICALIZE, 0, &uri));
+}
 bool same_uri(IUri *expected, LPCWSTR text) {
-    ComPtr<IUri> actual; BOOL equal = FALSE;
-    return expected && SUCCEEDED(CreateUri(text, Uri_CREATE_CANONICALIZE, 0, &actual)) &&
-        SUCCEEDED(expected->IsEqual(actual.Get(), &equal)) && equal;
+    ComPtr<IUri> actual;
+    std::wstring requested, observed;
+    // IUri::IsEqual is case-insensitive. Compare canonical strings instead so
+    // HTTP paths and fragments retain their case-sensitive identity.
+    return parse_native_uri(text, actual) &&
+        canonical_uri(expected, requested) && canonical_uri(actual.Get(), observed) && requested == observed;
 }
-void fail_initialization(WinContext &state, const std::shared_ptr<WinWindow> &value, const char *detail) {
-    state.initialization_failed(value, detail); dispose(value);
+bool same_http_request(IUri *expected, LPCWSTR text) {
+    ComPtr<IUri> actual;
+    std::wstring requested, observed;
+    if (!parse_native_uri(text, actual) || !canonical_uri(expected, requested) ||
+        !canonical_uri(actual.Get(), observed)) return false;
+    if (requested.compare(0, 7, L"http://") != 0 && requested.compare(0, 8, L"https://") != 0) return false;
+    // HTTP requests omit the document fragment; paths and queries remain exact.
+    if (const auto fragment = requested.find(L'#'); fragment != std::wstring::npos) requested.erase(fragment);
+    if (const auto fragment = observed.find(L'#'); fragment != std::wstring::npos) observed.erase(fragment);
+    return requested == observed;
 }
-
+bool fragment_only(IUri *requested, LPCWSTR source, bool &repeat) {
+    repeat = false;
+    ComPtr<IUri> current;
+    std::wstring old_uri, new_uri;
+    if (!parse_native_uri(source, current) ||
+        !canonical_uri(current.Get(), old_uri) || !canonical_uri(requested, new_uri)) return false;
+    if (new_uri.find(L'#') == std::wstring::npos ||
+        old_uri.substr(0, old_uri.find(L'#')) != new_uri.substr(0, new_uri.find(L'#'))) return false;
+    repeat = old_uri == new_uri;
+    return true;
+}
+bool pending_fragment(const std::shared_ptr<WinWindow> &value) {
+    return !value->bootstrap && value->ready && !value->closed && !value->failed && value->fragment_request &&
+        value->admit_request && !value->navigation_id && value->navigation_operation > 0 &&
+        value->operation_kind == Operation::navigation && value->operation == value->navigation_operation;
+}
+void finish_fragment(WinContext &state, const std::shared_ptr<WinWindow> &value, LPCWSTR source) {
+    if (!state.live(value) || !pending_fragment(value) || !same_uri(value->requested_uri.Get(), source)) return;
+    std::string url;
+    if (!narrow(source, url)) {
+        state.provider_failed(value, "WebView2 fragment URI exceeds text contract"); return;
+    }
+    const auto operation = value->navigation_operation;
+    value->admit_request = false; value->fragment_request = false;
+    value->admit_document_request = false;
+    value->navigation_operation = 0;
+    state.navigation_finished(value, operation, true, url, "");
+}
 bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shared_ptr<WinWindow> &window) {
     const std::weak_ptr<WinContext> weak_context = context;
     const std::weak_ptr<WinWindow> weak_window = window;
     EventRegistrationToken token{};
-    HRESULT result = window->view->add_NavigationStarting(Callback<ICoreWebView2NavigationStartingEventHandler>(
+    // NavigationStarting cancellation preserves the current document, but
+    // WebView2 may already send its GET while that callback is running. Gate
+    // document requests separately before network access. Subresources keep
+    // their normal browser behavior; this is not a general network sandbox.
+    ComPtr<ICoreWebView2WebResourceResponse> denied_response;
+    if (FAILED(window->environment->CreateWebResourceResponse(nullptr, 403, L"Forbidden",
+        L"Content-Type: text/plain\r\nContent-Length: 0\r\nCache-Control: no-store\r\n", &denied_response)) || !denied_response ||
+        FAILED(window->modern->AddWebResourceRequestedFilterWithRequestSourceKinds(L"*",
+            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT, COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL))) return false;
+    HRESULT result = window->view->add_WebResourceRequested(Callback<ICoreWebView2WebResourceRequestedEventHandler>(
+        [weak_context, weak_window, denied_response](ICoreWebView2 *sender, ICoreWebView2WebResourceRequestedEventArgs *args) -> HRESULT {
+            if (!args) return E_POINTER;
+            bool allowed = false;
+            callback(weak_context, weak_window, [&](auto &state, const auto &value) {
+                if (state.fatal() || value->failed || value->bootstrap || !value->ready) return;
+                ComPtr<ICoreWebView2WebResourceRequest> request;
+                COREWEBVIEW2_WEB_RESOURCE_CONTEXT resource = COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL;
+                WideText uri, method;
+                if (FAILED(args->get_ResourceContext(&resource)) || resource != COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT ||
+                    FAILED(args->get_Request(&request)) || !request || FAILED(request->get_Uri(&uri.value)) ||
+                    FAILED(request->get_Method(&method.value)) || !uri.value || !method.value) {
+                    state.provider_failed(value, "WebView2 document request metadata unavailable"); return;
+                }
+                if (value->admit_document_request && !value->policy_cancelled &&
+                    value->navigation_operation > 0 && value->operation_kind == Operation::navigation &&
+                    value->operation == value->navigation_operation && !wcsncmp(method.value, L"GET", 4) &&
+                    same_http_request(value->requested_uri.Get(), uri.value)) {
+                    // Independent of Starting ordering. Once consumed, a
+                    // redirect or later child request cannot reuse this grant.
+                    value->admit_document_request = false;
+                    allowed = true;
+                }
+            });
+            if (allowed) return S_OK;
+            // Keep the immutable local response available even after the weak
+            // context/window has expired. No late request is admitted by default.
+            const auto response = args->put_Response(denied_response.Get());
+            if (FAILED(response)) {
+                callback(weak_context, weak_window, [&](auto &state, const auto &value) {
+                    state.provider_failed(value, "WebView2 cannot deny a document request");
+                });
+                if (sender) sender->Stop();
+            }
+            return response;
+        }).Get(), &token);
+    if (FAILED(result)) return false;
+    result = window->view->add_NavigationStarting(Callback<ICoreWebView2NavigationStartingEventHandler>(
         [weak_context, weak_window](ICoreWebView2 *, ICoreWebView2NavigationStartingEventArgs *args) -> HRESULT {
             if (!args) return E_POINTER;
             args->put_Cancel(TRUE);
@@ -352,15 +545,51 @@ bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shar
                 if (FAILED(args->get_Uri(&uri.value)) || FAILED(args->get_IsRedirected(&redirected)) || FAILED(args->get_NavigationId(&id))) {
                     state.provider_failed(value, "WebView2 navigation metadata unavailable"); return;
                 }
-                if (value->admit_request && !redirected && same_uri(value->requested_uri.Get(), uri.value)) {
+                // WebView2 may announce its own initial about:blank before
+                // the asynchronous document-created helper is installed. It
+                // remains cancelled; only our subsequent NavigateToString is
+                // authorized. Do not expose an unrecoverable navigation event
+                // before the consumer has received Ready.
+                if (value->bootstrap && !redirected && uri.value && !wcscmp(uri.value, L"about:blank")) return;
+                if (value->bootstrap && !value->admit_request) {
+                    fail_initialization(state, value, "WebView2 requested an unexpected navigation before initialization");
+                    return;
+                }
+                const bool requested = value->admit_request && !redirected &&
+                    (value->requested_html_uri.empty() ? same_uri(value->requested_uri.Get(), uri.value) :
+                     uri.value && !wcsncmp(uri.value, value->requested_html_uri.c_str(), value->requested_html_uri.size() + 1));
+                if (value->admit_request && !redirected && requested) {
                     value->admit_request = false; value->navigation_id = id;
+                    value->requested_html_uri.clear();
                     if (FAILED(args->put_Cancel(FALSE))) state.provider_failed(value, "WebView2 cannot authorize navigation");
                     return;
                 }
-                if (id == value->navigation_id) value->policy_cancelled = true;
+                if (value->bootstrap) {
+                    fail_initialization(state, value, "WebView2 initial document did not match its authorized HTML content");
+                    return;
+                }
+                if (id == value->navigation_id) {
+                    value->policy_cancelled = true;
+                    value->admit_document_request = false;
+                }
                 std::string url;
                 if (!narrow(uri.value, url)) { state.provider_failed(value, "WebView2 requested URI exceeds text contract"); return; }
                 state.navigation_requested(value, url);
+            });
+            return S_OK;
+        }).Get(), &token);
+    if (FAILED(result)) return false;
+    result = window->view->add_SourceChanged(Callback<ICoreWebView2SourceChangedEventHandler>(
+        [weak_context, weak_window](ICoreWebView2 *sender, ICoreWebView2SourceChangedEventArgs *args) -> HRESULT {
+            callback(weak_context, weak_window, [&](auto &state, const auto &value) {
+                if (!pending_fragment(value)) return;
+                BOOL new_document = TRUE;
+                WideText raw;
+                if (!args || FAILED(args->get_IsNewDocument(&new_document)) ||
+                    !sender || FAILED(sender->get_Source(&raw.value))) {
+                    state.provider_failed(value, "WebView2 fragment navigation metadata unavailable"); return;
+                }
+                if (!new_document) finish_fragment(state, value, raw.value);
             });
             return S_OK;
         }).Get(), &token);
@@ -370,6 +599,10 @@ bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shar
             if (!args) return E_POINTER;
             args->put_Cancel(TRUE);
             callback(weak_context, weak_window, [&](auto &state, const auto &value) {
+                if (value->bootstrap) {
+                    fail_initialization(state, value, "WebView2 requested a child-frame navigation during initialization");
+                    return;
+                }
                 WideText raw; std::string url;
                 if (FAILED(args->get_Uri(&raw.value)) || !narrow(raw.value, url)) state.provider_failed(value, "WebView2 frame URI unavailable");
                 else state.navigation_requested(value, url);
@@ -386,18 +619,47 @@ bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shar
                 }
                 if (value->failed || id != value->navigation_id) return;
                 value->admit_request = false; value->navigation_id = 0;
+                value->admit_document_request = false;
+                value->fragment_request = false;
                 if (value->bootstrap) {
                     value->bootstrap = false;
-                    if (okay) state.initialized(value);
+                    if (okay) state.initialized(value, value->runtime_detail);
                     else fail_initialization(state, value, "WebView2 initial document failed");
                     return;
                 }
                 WideText raw; std::string url;
-                if (okay && (!sender || FAILED(sender->get_Source(&raw.value)) || !narrow(raw.value, url))) {
+                COREWEBVIEW2_WEB_ERROR_STATUS web_error = COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;
+                int http_status = 0;
+                if (!okay && !value->policy_cancelled) {
+                    if (FAILED(args->get_WebErrorStatus(&web_error))) {
+                        state.provider_failed(value, "WebView2 navigation error metadata unavailable"); return;
+                    }
+                    ComPtr<ICoreWebView2NavigationCompletedEventArgs2> response;
+                    if (SUCCEEDED(args->QueryInterface(IID_PPV_ARGS(&response)))) {
+                        if (FAILED(response->get_HttpStatusCode(&http_status))) http_status = 0;
+                    }
+                    // WebView2 reports HTTP error documents as unsuccessful.
+                    // A completed 4xx/5xx response with no native transport,
+                    // certificate, cancellation or authentication error is still
+                    // a document the application can inspect. Require the exact
+                    // authorized HTTP(S) document identity as well as its status.
+                    if (http_status >= 400 && http_status <= 599 &&
+                        web_error == COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN) {
+                        if (!sender || FAILED(sender->get_Source(&raw.value)) || !raw.value || !narrow(raw.value, url)) {
+                            state.provider_failed(value, "WebView2 HTTP error document URI unavailable"); return;
+                        }
+                        okay = (url.compare(0, 7, "http://") == 0 || url.compare(0, 8, "https://") == 0) &&
+                            same_uri(value->requested_uri.Get(), raw.value);
+                    }
+                }
+                if (okay && !raw.value && (!sender || FAILED(sender->get_Source(&raw.value)) || !raw.value || !narrow(raw.value, url))) {
                     state.provider_failed(value, "WebView2 completed URI exceeds text contract"); return;
                 }
+                const std::string detail = value->policy_cancelled ? "WebView2 navigation cancelled by application policy" :
+                    okay ? "" : "WebView2 navigation failed (native=" + std::to_string(static_cast<int>(web_error)) +
+                    ", HTTP=" + std::to_string(http_status) + ")";
                 state.navigation_finished(value, value->navigation_operation, okay && !value->policy_cancelled, url,
-                    value->policy_cancelled ? "WebView2 navigation cancelled by application policy" : okay ? "" : "WebView2 navigation failed",
+                    detail,
                     value->policy_cancelled ? NILWV_FAILURE_CANCELLED : NILWV_FAILURE_NATIVE);
                 value->navigation_operation = 0;
             });
@@ -407,6 +669,10 @@ bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shar
     result = window->view->add_WebMessageReceived(Callback<ICoreWebView2WebMessageReceivedEventHandler>(
         [weak_context, weak_window](ICoreWebView2 *, ICoreWebView2WebMessageReceivedEventArgs *args) -> HRESULT {
             callback(weak_context, weak_window, [&](auto &state, const auto &value) {
+                if (value->bootstrap) {
+                    fail_initialization(state, value, "WebView2 received a page message during initialization");
+                    return;
+                }
                 WideText raw, source; std::string payload; Provenance provenance;
                 if (!args || FAILED(args->TryGetWebMessageAsString(&raw.value)) || !narrow(raw.value, payload)) {
                     state.provider_failed(value, "WebView2 message must be bounded serialized JSON text"); return;
@@ -428,6 +694,10 @@ bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shar
             if (!args) return E_POINTER;
             args->put_Handled(TRUE);
             callback(weak_context, weak_window, [&](auto &state, const auto &value) {
+                if (value->bootstrap) {
+                    fail_initialization(state, value, "WebView2 requested a new window during initialization");
+                    return;
+                }
                 WideText raw; std::string url;
                 if (FAILED(args->get_Uri(&raw.value)) || !narrow(raw.value, url)) state.provider_failed(value, "WebView2 new-window URI unavailable");
                 else state.navigation_requested(value, url);
@@ -450,7 +720,10 @@ bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shar
     if (FAILED(result)) return false;
     result = window->view->add_WindowCloseRequested(Callback<ICoreWebView2WindowCloseRequestedEventHandler>(
         [weak_context, weak_window](ICoreWebView2 *, IUnknown *) -> HRESULT {
-            callback(weak_context, weak_window, [](auto &state, const auto &value) { state.close_requested(value); });
+            callback(weak_context, weak_window, [](auto &state, const auto &value) {
+                if (value->bootstrap) fail_initialization(state, value, "WebView2 requested closure during initialization");
+                else state.close_requested(value);
+            });
             return S_OK;
         }).Get(), &token);
     if (FAILED(result)) return false;
@@ -495,6 +768,7 @@ void initialize_controller(const std::shared_ptr<WinContext> &context, const std
                     if (window->failed) return;
                     if (FAILED(error) || !id) { fail_initialization(state, window, "WebView2 message helper registration failed"); return; }
                     window->script_id = id;
+                    window->requested_html_uri = wide(html_navigation_uri("<!doctype html><html></html>"));
                     window->admit_request = true;
                     if (FAILED(CreateUri(L"about:blank", Uri_CREATE_CANONICALIZE, 0, &window->requested_uri)) ||
                         FAILED(window->view->NavigateToString(L"<!doctype html><html></html>")))
@@ -579,32 +853,49 @@ void window(nilwv_context_v1 *context, nilwv_text_v1 title, std::int64_t width, 
             Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
                 [weak_context, weak_window, profile, completion](HRESULT error, ICoreWebView2Environment *environment) -> HRESULT {
                     const FinishCompletion finished{completion};
+                    profile->environment_status = error;
+                    // Only an existing owner can initiate work during its drain.
+                    // A callback arriving after the bounded context lifetime must
+                    // not launch a new controller or retain new COM observers.
+                    const auto owner_context = weak_context.lock();
+                    if (!owner_context || !owner_context->owner_thread()) return S_OK;
                     bool observed = false;
                     if (SUCCEEDED(error) && environment) {
                         observed = observe_browser_exit(profile, environment);
                         if (!observed) profile->await_browser_exit = true;
                     }
+                    bool controller_requested = false;
+                    bool ownership_failed = false;
                     callback(weak_context, weak_window, [&](auto &owner, const auto &live_window) {
                         if (live_window->failed) return;
                         if (FAILED(error) || !environment) { fail_initialization(owner, live_window, "WebView2 environment initialization failed"); return; }
-                        ComPtr<ICoreWebView2Environment7> identified;
-                        WideText actual;
-                        if (FAILED(environment->QueryInterface(IID_PPV_ARGS(&identified))) ||
-                            FAILED(identified->get_UserDataFolder(&actual.value)) || !actual.value ||
-                            _wcsicmp(actual.value, profile->directory.c_str()) != 0) {
+                        if (!private_environment(profile, environment)) {
+                            ownership_failed = true;
                             fail_initialization(owner, live_window, "WebView2 did not honor its isolated profile directory"); return;
                         }
                         if (!observed) {
                             fail_initialization(owner, live_window, "WebView2 browser resource lifetime observation unavailable"); return;
                         }
+                        WideText runtime_version;
+                        std::string version;
+                        if (FAILED(environment->get_BrowserVersionString(&runtime_version.value)) ||
+                            !runtime_version.value || !narrow(runtime_version.value, version, 128) || version.empty()) {
+                            fail_initialization(owner, live_window, "WebView2 environment runtime version unavailable"); return;
+                        }
+                        // Actual environment identity, independent of the SDK
+                        // loader version and probe's available-runtime check.
+                        live_window->runtime_detail = "WebView2 " + version;
                         live_window->environment = environment;
                         const auto controller_completion = std::make_shared<Completion>(profile);
                         const bool browser_already_started = profile->await_browser_exit;
                         profile->await_browser_exit = true;
+                        controller_requested = true;
+                        profile->controller_requested = true;
                         const auto creation = environment->CreateCoreWebView2Controller(live_window->handle,
                             Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
                                 [weak_context, weak_window, profile, controller_completion](HRESULT failure, ICoreWebView2Controller *controller) -> HRESULT {
                                     const FinishCompletion finished{controller_completion};
+                                    profile->controller_status = SUCCEEDED(failure) && !controller ? E_POINTER : failure;
                                     bool retained = false;
                                     callback(weak_context, weak_window, [&](auto &, const auto &ready_window) {
                                         if (ready_window->failed) return;
@@ -617,21 +908,27 @@ void window(nilwv_context_v1 *context, nilwv_text_v1 title, std::int64_t width, 
                                         if (auto owner = weak_context.lock()) initialize_controller(owner, ready_window);
                                     });
                                     // A closed/destroyed context cannot retain a late controller.
-                                    if (!retained && controller) {
-                                        ComPtr<ICoreWebView2> abandoned; UINT32 pid = 0;
-                                        if (!profile->browser && SUCCEEDED(controller->get_CoreWebView2(&abandoned)) &&
-                                            SUCCEEDED(abandoned->get_BrowserProcessId(&pid)) && pid)
-                                            profile->browser = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-                                        controller->Close();
+                                    if (!retained && controller) close_unretained_controller(profile, controller);
+                                    if (!controller && profile->retired && profile->exit_registered) {
+                                        // The original HWND may have closed while native
+                                        // controller creation was pending. Finish the same
+                                        // private environment's lifecycle without that HWND.
+                                        const auto owner = weak_context.lock();
+                                        if (owner && owner->owner_thread())
+                                            close_retired_environment(profile, profile->exit_environment.Get());
                                     }
                                     return S_OK;
                                 }).Get());
                         if (FAILED(creation)) {
+                            profile->controller_status = creation;
                             controller_completion->finish();
                             profile->await_browser_exit = browser_already_started;
                             fail_initialization(owner, live_window, "WebView2 controller creation unavailable");
+                            close_retired_environment(profile, environment);
                         }
                     });
+                    if (SUCCEEDED(error) && environment && observed && profile->retired && !controller_requested && !ownership_failed)
+                        close_retired_environment(profile, environment);
                     return S_OK;
                 }).Get());
         if (FAILED(result)) {
@@ -653,11 +950,40 @@ void navigate_common(nilwv_context_v1 *context, std::int64_t id, nilwv_text_v1 i
         if ((!html && !navigation_uri(data)) || FAILED(CreateUri(html ? L"about:blank" : text.c_str(), Uri_CREATE_CANONICALIZE, 0, &uri))) {
             state.fail(out, NILWV_E_ARGUMENT, "WebView navigation requires an HTTP(S) URI or about:blank"); return;
         }
+        auto html_uri = html ? wide(html_navigation_uri(data)) : std::wstring{};
+        bool fragment = false, repeat = false;
+        std::string repeated_source;
+        if (!html) {
+            WideText current;
+            if (SUCCEEDED(value->view->get_Source(&current.value))) {
+                fragment = fragment_only(uri.Get(), current.value, repeat);
+                if (fragment && repeat && !narrow(current.value, repeated_source)) {
+                    state.fail(out, NILWV_E_NATIVE, "WebView2 repeated fragment source exceeds text contract"); return;
+                }
+            }
+        }
         const auto operation = state.start(value, Operation::navigation, out); if (!operation) return;
+        // Repeating the already-current fragment is explicitly idempotent.
+        // Older WebView2 versions would reload here, while newer versions do
+        // nothing. Report the observed native Source without queuing a reload
+        // whose delayed Starting event could escape this operation's lifetime.
+        if (fragment && repeat) {
+            state.navigation_finished(value, operation, true, repeated_source, ""); return;
+        }
         value->admit_request = true; value->policy_cancelled = false; value->navigation_id = 0;
+        value->admit_document_request = !html && !fragment &&
+            (data.compare(0, 7, "http://") == 0 || data.compare(0, 8, "https://") == 0);
         value->requested_uri = uri; value->navigation_operation = operation;
+        value->requested_html_uri = std::move(html_uri);
+        value->fragment_request = fragment;
         const HRESULT result = html ? value->view->NavigateToString(text.c_str()) : value->view->Navigate(text.c_str());
-        if (FAILED(result)) { value->admit_request = false; value->navigation_operation = 0; state.reject(value, operation, out, "WebView2 rejected the navigation"); }
+        if (FAILED(result)) {
+            value->admit_request = false; value->fragment_request = false;
+            value->admit_document_request = false;
+            value->navigation_operation = 0;
+            value->requested_html_uri.clear();
+            state.reject(value, operation, out, "WebView2 rejected the navigation");
+        }
     });
 }
 void navigate(nilwv_context_v1 *context, std::int64_t id, nilwv_text_v1 text, nilwv_result_v1 *out) noexcept { navigate_common(context, id, text, out, false); }
@@ -710,6 +1036,7 @@ void poll(nilwv_context_v1 *context, std::int64_t id, nilwv_result_v1 *out) noex
         state.expire_operations();
         for (const auto &weak : state.native_windows) if (auto value = weak.lock(); value && value->failed) {
             value->admit_request = false;
+            value->admit_document_request = false;
             if (value->view) value->view->Stop();
         }
         collect_profiles(state, Clock::now() + std::chrono::milliseconds(2), 256);

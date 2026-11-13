@@ -20,6 +20,8 @@ struct MacWindow final : Window {
     bool bootstrap = true;
     bool admit_request = false;
     bool policy_cancelled = false;
+    bool fragment_navigation = false;
+    bool fragment_dispatch_complete = false;
     NSURL *requested_url = nil;
 };
 struct MacContext final : Context {
@@ -42,6 +44,7 @@ bool from_ns(NSString *value, std::string &output, std::size_t limit = NILWV_MAX
 void dispose(const std::shared_ptr<MacWindow> &window) {
     if (!window) return;
     window->admit_request = false;
+    window->fragment_navigation = false;
     [window->view.configuration.userContentController removeScriptMessageHandlerForName:@"nilwebview"];
     window->view.navigationDelegate = nil;
     window->view.UIDelegate = nil;
@@ -105,12 +108,13 @@ void callback(const std::weak_ptr<MacContext> &weak_context,
                 state.provider_failed(value, "WebKit navigation URI exceeds the text contract"); return;
             }
             state.navigation_requested(value, url);
-            if (action.targetFrame.isMainFrame && value->navigation) {
+            if (action.targetFrame.isMainFrame && (value->navigation || value->fragment_navigation)) {
                 // A policy cancellation need not produce a later navigation
                 // delegate error. Complete the owned operation here and clear
                 // its native identity first, so late callbacks cannot finish
                 // a newer application navigation.
                 value->policy_cancelled = true;
+                value->fragment_navigation = false;
                 value->admit_request = false;
                 value->navigation = nil;
                 const auto operation = value->navigation_operation;
@@ -133,10 +137,16 @@ void callback(const std::weak_ptr<MacContext> &weak_context,
         });
     }
 }
+- (void)webView:(WKWebView *)webView didStartProvisionalNavigation:(WKNavigation *)navigation {
+    (void)webView;
+    nilwebview::macos::callback(context, window, [&](auto &, const auto &value) {
+        if (value->fragment_navigation || navigation == value->navigation) value->fragment_navigation = false;
+    });
+}
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
     nilwebview::macos::callback(context, window, [&](auto &state, const auto &value) {
         if (navigation != value->navigation || value->failed) return;
-        value->admit_request = false; value->navigation = nil;
+        value->admit_request = false; value->navigation = nil; value->fragment_navigation = false;
         if (value->bootstrap) { value->bootstrap = false; state.initialized(value); return; }
         std::string url;
         if (!nilwebview::macos::from_ns(webView.URL.absoluteString, url)) {
@@ -149,7 +159,7 @@ void callback(const std::weak_ptr<MacContext> &weak_context,
 - (void)failedNavigation:(WKNavigation *)navigation {
     nilwebview::macos::callback(context, window, [&](auto &state, const auto &value) {
         if (navigation != value->navigation || value->failed) return;
-        value->admit_request = false; value->navigation = nil;
+        value->admit_request = false; value->navigation = nil; value->fragment_navigation = false;
         if (value->bootstrap) { state.initialization_failed(value, "WebKit initial page failed"); return; }
         state.navigation_finished(value, value->navigation_operation, false, "",
             value->policy_cancelled ? "WebKit navigation cancelled by application policy" : "WebKit navigation failed",
@@ -290,19 +300,58 @@ void show(nilwv_context_v1 *context, std::int64_t id, nilwv_result_v1 *out) {
     call(context, out, [&](MacContext &state) { auto value = state.window(id, out); if (!value) return;
         [std::static_pointer_cast<MacWindow>(value)->native_window makeKeyAndOrderFront:nil]; success(out); });
 }
-void navigate_common(nilwv_context_v1 *context, std::int64_t id, nilwv_text_v1 input, nilwv_result_v1 *out, bool html) {
+void navigate_common(nilwv_context_v1 *context, std::int64_t window_id, nilwv_text_v1 input, nilwv_result_v1 *out, bool html) {
     call(context, out, [&](MacContext &state) {
         std::string data; if (!state.read_text(input, data, out, html)) return;
-        auto base = state.window(id, out); if (!base) return; auto value = std::static_pointer_cast<MacWindow>(base);
+        auto base = state.window(window_id, out); if (!base) return; auto value = std::static_pointer_cast<MacWindow>(base);
         NSURL *url = html ? [NSURL URLWithString:@"about:blank"] : [NSURL URLWithString:to_ns(data)];
         if (!html && (!navigation_uri(data) || !url || (![url.scheme isEqualToString:@"about"] && !url.host.length))) {
             state.fail(out, NILWV_E_ARGUMENT, "WebView navigation requires an HTTP(S) URI or about:blank"); return;
         }
+        std::string current_uri, requested_uri;
+        const bool native_uris = !html && from_ns(value->view.URL.absoluteString, current_uri) &&
+            from_ns(url.absoluteString, requested_uri);
+        const auto fragment = requested_uri.find('#');
+        const bool fragment_navigation = native_uris && !value->view.loading &&
+            fragment != std::string::npos &&
+            current_uri.compare(0, current_uri.find('#'), requested_uri, 0, fragment) == 0;
+        const bool repeated_fragment = fragment_navigation && current_uri == requested_uri;
+        NSString *fragment_script = fragment_navigation && !repeated_fragment
+            ? to_ns("window.location.assign(" + json_string(requested_uri) + "); void 0;") : nil;
         const auto operation = state.start(value, Operation::navigation, out); if (!operation) return;
+        if (repeated_fragment) {
+            // Consistent across native engines: an exact settled fragment URI
+            // completes idempotently without reloading or replacing its DOM.
+            state.navigation_finished(value, operation, true, requested_uri);
+            return;
+        }
         value->admit_request = true; value->policy_cancelled = false; value->requested_url = url; value->navigation_operation = operation;
+        value->fragment_navigation = fragment_navigation;
+        value->fragment_dispatch_complete = false;
+        if (fragment_navigation) {
+            // loadRequest can replace this document for fragment URLs. The
+            // native Location operation preserves it and still visits policy.
+            value->navigation = nil;
+            std::weak_ptr<MacContext> weak_context = context->state; std::weak_ptr<MacWindow> weak_window = value;
+            [value->view evaluateJavaScript:fragment_script completionHandler:^(id answer, NSError *error) {
+                (void)answer;
+                callback(weak_context, weak_window, [&](auto &owner, const auto &live_window) {
+                    if (live_window->failed || !live_window->fragment_navigation ||
+                        live_window->navigation_operation != operation || live_window->operation != operation ||
+                        live_window->operation_kind != Operation::navigation) return;
+                    if (error) {
+                        live_window->fragment_navigation = false; live_window->admit_request = false;
+                        live_window->navigation_operation = 0;
+                        owner.navigation_finished(live_window, operation, false, "",
+                            "WebKit same-document navigation dispatch failed");
+                    } else live_window->fragment_dispatch_complete = true;
+                });
+            }];
+            return;
+        }
         value->navigation = html ? [value->view loadHTMLString:to_ns(data) baseURL:nil] : [value->view loadRequest:[NSURLRequest requestWithURL:url]];
         if (!value->navigation) {
-            value->admit_request = false; value->navigation_operation = 0;
+            value->admit_request = false; value->navigation_operation = 0; value->fragment_navigation = false;
             state.reject(value, operation, out, "WebKit rejected the navigation");
         }
     });
@@ -341,8 +390,25 @@ void poll(nilwv_context_v1 *context, std::int64_t id, nilwv_result_v1 *out) {
             if (!event && run != kCFRunLoopRunHandledSource) break;
         }
         state.expire_operations();
-        for (const auto &weak : state.native_windows) if (auto value = weak.lock(); value && value->failed) {
-            value->admit_request = false; [value->view stopLoading];
+        for (const auto &weak : state.native_windows) if (auto value = weak.lock(); value && state.live(value)) {
+            if (value->failed) {
+                value->admit_request = false; value->fragment_navigation = false; [value->view stopLoading];
+            } else if (value->fragment_navigation && value->fragment_dispatch_complete && value->navigation_operation > 0 &&
+                       value->operation_kind == Operation::navigation && value->operation == value->navigation_operation &&
+                       !value->bootstrap && !value->admit_request && !value->policy_cancelled &&
+                       !value->view.loading && [value->view.URL isEqual:value->requested_url]) {
+                // Same-document navigation has no public didFinish callback.
+                // Pair completed native dispatch and exact policy admission
+                // with a settled native URI, never a provisional URL alone.
+                std::string uri;
+                if (!from_ns(value->view.URL.absoluteString, uri)) {
+                    state.provider_failed(value, "WebKit completed URI exceeds the text contract");
+                    continue;
+                }
+                const auto operation = value->navigation_operation;
+                value->navigation_operation = 0; value->navigation = nil; value->fragment_navigation = false;
+                state.navigation_finished(value, operation, true, uri);
+            }
         }
         state.poll(id, out);
     });

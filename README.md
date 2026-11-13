@@ -11,12 +11,12 @@ WebView2 on Windows, and WKWebView on macOS.
 
 ## Status
 
-This is the initial implementation. Shared ownership, JSON transport and checked
-framework integration have local automated coverage. The Matrix wrapper has
-been exercised with a synthetic provider through textual NIL, binary NIL,
-native compilation and JIT. Actual browser qualification on Linux, Windows,
-Intel macOS and Apple Silicon macOS is pending. A synthetic provider pass does
-not establish browser behavior or qualify a published SDK.
+The current source profile is implemented on Linux, Windows, Intel macOS and
+Apple Silicon macOS. Each platform has a required real-browser check through
+textual NIL, binary NIL, native compilation and JIT. See
+[platform support and evidence](docs/platform-support.md) for the exact scope
+and [current checks](https://github.com/exec-software/exec-nil-framework-webview/actions/workflows/test.yml)
+for qualification results. These source checks do not qualify a published SDK.
 
 The current profile provides hidden-window creation, explicit showing,
 navigation, loading HTML, synchronous JavaScript function evaluation, copied
@@ -48,9 +48,11 @@ alone is not proof of origin. Applications that require origin or frame checks
 must reject messages when the required native metadata is unavailable.
 
 Navigation accepts HTTP, HTTPS and `about:blank`. Each explicit call authorizes
-one initial request. Redirects and uninitiated navigation are cancelled and
+one initial request. Redirects and uninitiated document loads are cancelled and
 reported as `NavigationRequested`; the application may validate the requested
 destination and explicitly navigate after the previous operation completes.
+Same-document fragment and history changes may update the current URL without
+loading another document; they do not grant permission to load a new page.
 
 ## Build and try the example
 

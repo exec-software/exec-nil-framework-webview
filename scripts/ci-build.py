@@ -24,7 +24,7 @@ FRAMEWORK_TESTS = {
     'nil.markup-contract': '392 markup contract checks passed',
 }
 PROVIDER_TESTS = {
-    'webview.shared': '196 WebView shared checks passed',
+    'webview.shared': '209 WebView shared checks passed',
     'webview.script-transport': '36 WebView script checks passed',
 }
 
@@ -128,6 +128,13 @@ def main() -> int:
             elif platform.system() == 'Darwin':
                 command('macos-version', ['sw_vers'], 20)
             flags = ['-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release', '-DBUILD_TESTING=ON']
+            if platform.system() == 'Windows':
+                # CMake's compiler probes otherwise use /Zi and can retain an
+                # mspdbsrv.exe helper after the probe exits. Embed debug info
+                # in each object instead; try_compile inherits this policy.
+                # Keep the owned-process cleanup gate unchanged.
+                flags += ['-DCMAKE_POLICY_DEFAULT_CMP0141=NEW',
+                          '-DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded']
             native = ['-DNIL_ENABLE_LLVM=ON', '-DNIL_BUILD_EXPERIMENTAL_TOOLS=OFF',
                       '-DNILCOMPILER_SQLITE_INCLUDE_DIR=OFF', '-DNILCOMPILER_POSTGRESQL_INCLUDE_DIR=OFF',
                       '-DPython3_EXECUTABLE=' + sys.executable, '-DLLVM_DIR=' + str(args.llvm_dir.resolve()),

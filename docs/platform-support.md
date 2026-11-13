@@ -1,21 +1,57 @@
 # Platform support and evidence
 
-The initial provider implementations target the four hosts below. Actual
-browser qualification is pending; this table must not be read as a release or
-SDK compatibility guarantee.
+The current provider profile is implemented for the four hosts below. Each
+host has a required real-browser check; implementation alone is not a passing
+qualification result or an installed-SDK compatibility guarantee.
 
-| Host | Native provider | Native page-message metadata | Current browser evidence |
+| Host | Native provider | Native page-message metadata | Required browser check |
 | --- | --- | --- | --- |
-| Linux x86-64 | GTK4 + WebKitGTK 6 | None; capabilities are zero, sender fields/frame unknown | Pending |
-| Windows x86-64 | Win32 + WebView2 | Native sender URL and main-frame identity from the top-level message event; origin unavailable | Pending |
-| macOS Intel | AppKit + WKWebView | Native frame URL, security origin when available, and frame identity | Pending |
-| macOS Apple Silicon | AppKit + WKWebView | Same API profile as Intel; requires its own architecture run | Pending |
+| Linux x86-64 | GTK4 + WebKitGTK 6 | None; capabilities are zero, sender fields/frame unknown | `webview-linux-x86_64` |
+| Windows x86-64 | Win32 + WebView2 | Native sender URL and main-frame identity from the top-level message event; origin unavailable | `webview-windows-x86_64` |
+| macOS Intel | AppKit + WKWebView | Native frame URL, security origin when available, and frame identity | `webview-macos-x86_64` |
+| macOS Apple Silicon | AppKit + WKWebView | Same API profile as Intel, tested independently | `webview-macos-arm64` |
 
-Shared controls have local native coverage, including owner-thread and handle
-checks, timeouts, queue limits, immutable snapshots, JSON validation and actual
-generated JavaScript transport tests. Matrix wrapper checks with a synthetic
-provider pass through textual NIL, binary NIL, native compilation and JIT.
-These establish the checked interface, not a real engine's behavior.
+See the [current platform runs](https://github.com/exec-software/exec-nil-framework-webview/actions/workflows/test.yml)
+and the [initial qualification PR](https://github.com/exec-software/exec-nil-framework-webview/pull/1).
+A run is qualified only when its required jobs pass. Cancelled builds, missing
+desktops, partial route results and retained private profiles are failures or
+incomplete evidence, not platform passes.
+
+## Source qualification evidence
+
+The workflow pins framework revision
+`e7bc2a00e6854084b7b5084e29fa50456cbe8977`. Each job records its actual WebView
+checkout (including GitHub's PR merge revision), framework revision, host,
+toolchain, standard library and browser dependency identities. Download the
+job's evidence artifact to inspect those identities, exact contract inventories,
+route output, cleanup results and unchanged-source hashes.
+
+Each host must verify seven exact framework/provider contracts: 57 runtime
+checks, 28 WebView ABI checks, 40 UI ABI checks, 216 formatted-text checks,
+392 markup checks, 209 shared-provider checks and 36 JavaScript transport
+checks. It then executes four synthetic and four actual browser consumers
+through textual NIL, binary NIL, AOT and JIT. Every real-browser route must pass
+all 17 behavior groups, including navigation policy, messages, dialogs, script
+failures, copied events and window closure. No contract may be skipped.
+
+The browser fixture includes an initial full-document URL with a fragment,
+changed and repeated same-document fragments, preserved DOM and JavaScript
+state, a cancelled redirect followed by explicit host navigation, and a real
+HTTP error document. Its owned HTTP server must observe exactly one request
+each for the initial page, redirect, explicit follow and error document.
+Windows enforces initial document requests before network dispatch as well as
+cancelling unapproved navigation: [WebView2 documents that navigation cancellation alone can allow an early GET](https://learn.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/icorewebview2navigationstartingeventargs#get_cancel).
+Ordinary subresources retain normal browser behavior. This is not a general
+network sandbox.
+
+All 14 owned commands and the loopback HTTP fixture must clean up, and source,
+toolchain, standard-library and copied-provider hashes must remain unchanged.
+Windows also checks for private profile remnants after every browser route,
+including a window closed during asynchronous initialization. Linux verifies a
+real browser namespace launch and restores the exact pre-test AppArmor profile
+inventory. Mac evidence records the actual OS version for its system WKWebView;
+Windows records the actual WebView2 environment version separately from the
+pinned SDK/loader version.
 
 ## Dependencies and builds
 
@@ -66,6 +102,17 @@ standard library and browser dependency identities in the report. Distinguish
 source builds from installed SDKs. Record failures, missing desktop sessions
 and skipped assertions explicitly. Do not activate a candidate SDK or replace a
 user installation as part of qualification.
+
+Hosted Linux qualification grants only the installed WebKit bubblewrap
+executable a temporary AppArmor user-namespace allowance, verifies a real
+namespace launch, and removes the owned profile afterward. The WebKit sandbox
+stays enabled; no global user-namespace policy is relaxed. Hosted Windows
+qualification disables optional MSVC telemetry and temporarily removes only the
+selected compiler's verified optional uploader. Its bytes, owner/group/DACL and
+saved telemetry preferences are restored in the job's final cleanup. These
+steps target disposable GitHub runners, not developer machines.
+CMake's Windows probes and builds use embedded MSVC debug information (`/Z7`)
+to avoid leaving a persistent compiler PDB server after the owning command exits.
 
 ## Distribution
 

@@ -187,9 +187,11 @@ void Context::reject(const std::shared_ptr<Window> &window, std::int64_t id, nil
 bool Context::matches(const std::shared_ptr<Window> &window, std::int64_t id, Operation kind) const noexcept {
     return live(window) && !window->failed && id > 0 && window->operation == id && window->operation_kind == kind;
 }
-void Context::initialized(const std::shared_ptr<Window> &window) {
+void Context::initialized(const std::shared_ptr<Window> &window, const std::string &detail) {
     if (!live(window) || window->ready || window->failed) return;
-    window->ready = true; enqueue(event_for(window, NILWV_EVENT_READY));
+    window->ready = true;
+    auto event = event_for(window, NILWV_EVENT_READY);
+    event.detail = detail; enqueue(std::move(event));
 }
 void Context::initialization_failed(const std::shared_ptr<Window> &window, const std::string &detail) {
     if (!live(window) || window->ready || window->failed) return;

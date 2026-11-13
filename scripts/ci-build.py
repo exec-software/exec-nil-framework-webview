@@ -24,7 +24,7 @@ FRAMEWORK_TESTS = {
     'nil.markup-contract': '392 markup contract checks passed',
 }
 PROVIDER_TESTS = {
-    'webview.shared': '196 WebView shared checks passed',
+    'webview.shared': '197 WebView shared checks passed',
     'webview.script-transport': '36 WebView script checks passed',
 }
 

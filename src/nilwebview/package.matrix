@@ -1,0 +1,145 @@
+@pragma once
+book nilwebview
+read nil.std.core.option
+read nil.std.core.result
+read nilwebview.types
+
+note intrinsic "webview.v1.configure"
+wv-configure receives provider-path as text returns Result of number, text
+
+note intrinsic "webview.v1.window"
+wv-window receives title as text, width as number, height as number returns Result of number, text
+
+note intrinsic "webview.v1.show"
+wv-show receives window as number returns Result of number, text
+
+note intrinsic "webview.v1.navigate"
+wv-navigate receives window as number, url as text returns Result of number, text
+
+note intrinsic "webview.v1.load_html"
+wv-load-html receives window as number, html as text returns Result of number, text
+
+note intrinsic "webview.v1.evaluate_function"
+wv-evaluate-function receives window as number, body as text returns Result of number, text
+
+note intrinsic "webview.v1.poll"
+wv-poll receives window as number returns Result of number, text
+
+note intrinsic "webview.v1.event_number"
+wv-event-number receives snapshot as number, field-name as text returns Result of number, text
+
+note intrinsic "webview.v1.event_text"
+wv-event-text receives snapshot as number, field-name as text returns Result of text, text
+
+note intrinsic "webview.v1.release_event"
+wv-release-event receives snapshot as number returns Result of number, text
+
+note intrinsic "webview.v1.close"
+wv-close receives window as number returns Result of number, text
+
+!!! The path is an explicit absolute path to a trusted native provider library.
+!!! Configuration returns native metadata capabilities; an all-false set is valid.
+public configure receives provider-path as text returns Result of Capabilities, text begin paragraph
+    consider wv-configure with provider-path
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding flags then give Result.Ok holding (build nilwebview.Capabilities with
+            sender-url being ((flags remainder 2) equals 1),
+            sender-origin being (((flags over 2) remainder 2) equals 1),
+            sender-frame being (((flags over 4) remainder 2) equals 1))
+    end consider
+end paragraph
+
+!!! Returns a hidden pending window. Poll for Ready or InitializationFailed.
+public create-window receives title as text, width as number, height as number returns Result of Window, text begin paragraph
+    consider wv-window with title, width, height
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding handle then give Result.Ok holding (build nilwebview.Window with handle being handle)
+    end consider
+end paragraph
+
+wv-success receives outcome as Result of number, text returns Result of boolean, text begin paragraph
+    consider outcome
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding status then begin block
+            when status does not equal 1 then give Result.Error holding "Invalid WebView operation status" end when
+            give Result.Ok holding yes
+        end block
+    end consider
+end paragraph
+
+public show-window receives surface as Window returns Result of boolean, text begin paragraph
+    give wv-success with (wv-show with surface.handle)
+end paragraph
+public close-window receives surface as Window returns Result of boolean, text begin paragraph
+    give wv-success with (wv-close with surface.handle)
+end paragraph
+
+public navigate receives surface as Window, url as text returns Result of Operation, text begin paragraph
+    consider wv-navigate with surface.handle, url
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding identity then give Result.Ok holding (build nilwebview.Operation with window being surface, id being identity)
+    end consider
+end paragraph
+
+public load-html receives surface as Window, html as text returns Result of Operation, text begin paragraph
+    consider wv-load-html with surface.handle, html
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding identity then give Result.Ok holding (build nilwebview.Operation with window being surface, id being identity)
+    end consider
+end paragraph
+
+public evaluate-function receives surface as Window, body as text returns Result of Operation, text begin paragraph
+    consider wv-evaluate-function with surface.handle, body
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding identity then give Result.Ok holding (build nilwebview.Operation with window being surface, id being identity)
+    end consider
+end paragraph
+
+wv-kind receives code as number returns Result of EventKind, text begin paragraph
+    when code equals 1 then give Result.Ok holding EventKind.Ready end when
+    when code equals 2 then give Result.Ok holding EventKind.InitializationFailed end when
+    when code equals 3 then give Result.Ok holding EventKind.NavigationCompleted end when
+    when code equals 4 then give Result.Ok holding EventKind.NavigationFailed end when
+    when code equals 5 then give Result.Ok holding EventKind.ScriptCompleted end when
+    when code equals 6 then give Result.Ok holding EventKind.ScriptFailed end when
+    when code equals 7 then give Result.Ok holding EventKind.PageMessage end when
+    when code equals 8 then give Result.Ok holding EventKind.NavigationRequested end when
+    when code equals 9 then give Result.Ok holding EventKind.CloseRequested end when
+    when code equals 10 then give Result.Ok holding EventKind.ProviderFailed end when
+    give Result.Error holding "Invalid WebView kind"
+end paragraph
+
+wv-value-kind receives code as number returns Result of ValueKind, text begin paragraph
+    when code equals 0 then give Result.Ok holding ValueKind.None end when
+    when code equals 1 then give Result.Ok holding ValueKind.Json end when
+    when code equals 2 then give Result.Ok holding ValueKind.Undefined end when
+    give Result.Error holding "Invalid WebView value-kind"
+end paragraph
+
+wv-source-kind receives code as number returns Result of SourceKind, text begin paragraph
+    when code equals 0 then give Result.Ok holding SourceKind.Unknown end when
+    when code equals 1 then give Result.Ok holding SourceKind.NativeURL end when
+    when code equals 2 then give Result.Ok holding SourceKind.NativeOrigin end when
+    give Result.Error holding "Invalid WebView source-kind"
+end paragraph
+
+wv-frame-kind receives code as number returns Result of FrameKind, text begin paragraph
+    when code equals 0 then give Result.Ok holding FrameKind.Unknown end when
+    when code equals 1 then give Result.Ok holding FrameKind.Main end when
+    when code equals 2 then give Result.Ok holding FrameKind.Child end when
+    give Result.Error holding "Invalid WebView frame-kind"
+end paragraph
+
+wv-failure-kind receives code as number returns Result of FailureKind, text begin paragraph
+    when code equals 0 then give Result.Ok holding FailureKind.None end when
+    when code equals 1 then give Result.Ok holding FailureKind.Native end when
+    when code equals 2 then give Result.Ok holding FailureKind.ScriptException end when
+    when code equals 3 then give Result.Ok holding FailureKind.Serialization end when
+    when code equals 4 then give Result.Ok holding FailureKind.AsyncResult end when
+    when code equals 5 then give Result.Ok holding FailureKind.PayloadLimit end when
+    when code equals 6 then give Result.Ok holding FailureKind.Timeout end when
+    when code equals 7 then give Result.Ok holding FailureKind.Cancelled end when
+    give Result.Error holding "Invalid WebView failure-kind"
+end paragraph
+
+read nilwebview.events

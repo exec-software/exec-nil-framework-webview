@@ -1,0 +1,159 @@
+book nilwebview.examples.message_console
+
+read nilwebview
+read nil.std.core.option
+read nil.std.core.result
+read nil.std.system.std_sys
+read nil.std.io.file
+read nil.std.threading
+
+available-text receives supported as boolean returns text begin paragraph
+    when supported then give "available" end when
+    give "unavailable"
+end paragraph
+
+matches-operation receives notification as Event, expected as number returns boolean begin paragraph
+    consider notification.operation
+        when Option.None then give no
+        when Option.Some holding operation then give operation.id equals expected
+    end consider
+end paragraph
+
+main returns number begin paragraph
+    when (nil.std.system::arg_count with nothing) does not equal 4 then
+        say "Usage: message-console --provider ABSOLUTE_LIBRARY --html ABSOLUTE_HTML_FILE"
+        give 2
+    end when
+    when (nil.std.system::arg with 0) does not equal "--provider" or (nil.std.system::arg with 2) does not equal "--html" then
+        say "Expected --provider followed by --html."
+        give 2
+    end when
+    variable page as text is ""
+    consider nil.std.io::read_text with (nil.std.system::arg with 3)
+        when Result.Error holding failure then begin block
+            say "Cannot read the bundled page: " plus failure
+            give 1
+        end block
+        when Result.Ok holding content then set page to content
+    end consider
+    consider configure with (nil.std.system::arg with 1)
+        when Result.Error holding failure then begin block
+            say "Cannot configure the WebView provider: " plus failure
+            give 1
+        end block
+        when Result.Ok holding capabilities then begin block
+            say "Native sender URL metadata: " plus (available-text with capabilities.sender-url)
+            say "Native sender origin metadata: " plus (available-text with capabilities.sender-origin)
+            say "Native sender frame metadata: " plus (available-text with capabilities.sender-frame)
+        end block
+    end consider
+    variable surface as Window is build nilwebview.Window with handle being 0
+    consider create-window with "Matrix · Message console", 820, 600
+        when Result.Error holding failure then begin block
+            say "Cannot create a WebView window: " plus failure
+            give 1
+        end block
+        when Result.Ok holding created then set surface to created
+    end consider
+    variable running as boolean is yes
+    variable exit-code as number is 0
+    variable navigation-id as number is 0
+    variable script-id as number is 0
+    repeat while running
+        consider poll-event with surface
+            when Result.Error holding failure then begin block
+                say "WebView polling failed: " plus failure
+                set running to no
+                set exit-code to 1
+            end block
+            when Result.Ok holding pending then consider pending
+                when Option.None then evaluate sleep-ms with 8
+                when Option.Some holding notification then consider notification.kind
+                    when EventKind.Ready then begin block
+                        consider show-window with surface
+                            when Result.Error holding failure then begin block
+                                say "Cannot show the window: " plus failure
+                                set running to no
+                                set exit-code to 1
+                            end block
+                            when Result.Ok holding shown then begin block
+                                consider load-html with surface, page
+                                    when Result.Error holding failure then begin block
+                                        say "Cannot load the page: " plus failure
+                                        set running to no
+                                        set exit-code to 1
+                                    end block
+                                    when Result.Ok holding operation then begin block
+                                        set navigation-id to operation.id
+                                        say "Loading the bundled page."
+                                    end block
+                                end consider
+                            end block
+                        end consider
+                    end block
+                    when EventKind.NavigationCompleted then begin block
+                        when matches-operation with notification, navigation-id then
+                            say "Page loaded: " plus notification.payload-json
+                            consider evaluate-function with surface, "return {title:document.title,bridge:typeof window.nilwebview.post};"
+                                when Result.Error holding failure then say "Cannot start the page check: " plus failure
+                                when Result.Ok holding operation then begin block
+                                    set script-id to operation.id
+                                    say "Checking the page's JavaScript bridge."
+                                end block
+                            end consider
+                        otherwise
+                            say "Unexpected navigation completion."
+                            set running to no
+                            set exit-code to 1
+                        end when
+                    end block
+                    when EventKind.ScriptCompleted then begin block
+                        when matches-operation with notification, script-id then
+                            say "Script result: " plus notification.payload-json
+                        otherwise
+                            say "Unexpected script completion."
+                            set running to no
+                            set exit-code to 1
+                        end when
+                    end block
+                    when EventKind.PageMessage then begin block
+                        !!! The JSON is data only; this example never dispatches commands.
+                        say "Page message: " plus notification.payload-json
+                        say "Native sender URL: " plus notification.source-url
+                        say "Native sender origin: " plus notification.source-origin
+                    end block
+                    when EventKind.NavigationRequested then say "Navigation requires approval; kept this page: " plus notification.payload-json
+                    when EventKind.CloseRequested then set running to no
+                    when EventKind.InitializationFailed then begin block
+                        say "Browser initialization failed: " plus notification.detail
+                        set running to no
+                        set exit-code to 1
+                    end block
+                    when EventKind.NavigationFailed then begin block
+                        say "Navigation failed: " plus notification.detail
+                        set running to no
+                        set exit-code to 1
+                    end block
+                    when EventKind.ScriptFailed then begin block
+                        say "Page evaluation failed: " plus notification.detail
+                        set running to no
+                        set exit-code to 1
+                    end block
+                    when EventKind.ProviderFailed then begin block
+                        say "Browser provider failed: " plus notification.detail
+                        set running to no
+                        set exit-code to 1
+                    end block
+                end consider
+            end consider
+        end consider
+    end repeat
+    consider close-window with surface
+        when Result.Error holding failure then begin block
+            say "Window cleanup reported: " plus failure
+            set exit-code to 1
+        end block
+        when Result.Ok holding closed then say "Window closed."
+    end consider
+    give exit-code
+end paragraph

@@ -1,0 +1,13 @@
+/build/
+/out/
+/.deps/
+*.nil
+*.nilb
+*.o
+*.obj
+*.dll
+*.so
+*.dylib
+*.exe
+__pycache__/
+*.pyc

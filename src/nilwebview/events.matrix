@@ -1,0 +1,126 @@
+@pragma once
+book nilwebview
+read nil.std.core.option
+read nil.std.core.result
+read nilwebview.types
+
+wv-copy-event receives snapshot as number, surface as Window returns Result of Event, text begin paragraph
+    variable held-window as number is 0
+    consider wv-event-number with snapshot, "window"
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding content then set held-window to content
+    end consider
+    variable held-kind as number is 0
+    consider wv-event-number with snapshot, "kind"
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding content then set held-kind to content
+    end consider
+    variable held-sequence as number is 0
+    consider wv-event-number with snapshot, "sequence"
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding content then set held-sequence to content
+    end consider
+    variable held-operation as number is 0
+    consider wv-event-number with snapshot, "operation"
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding content then set held-operation to content
+    end consider
+    variable held-value-kind as number is 0
+    consider wv-event-number with snapshot, "value_kind"
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding content then set held-value-kind to content
+    end consider
+    variable held-source-kind as number is 0
+    consider wv-event-number with snapshot, "source_kind"
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding content then set held-source-kind to content
+    end consider
+    variable held-frame-kind as number is 0
+    consider wv-event-number with snapshot, "frame_kind"
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding content then set held-frame-kind to content
+    end consider
+    variable held-failure-kind as number is 0
+    consider wv-event-number with snapshot, "failure_kind"
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding content then set held-failure-kind to content
+    end consider
+    variable held-payload-json as text is ""
+    consider wv-event-text with snapshot, "payload_json"
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding content then set held-payload-json to content
+    end consider
+    variable held-source-url as text is ""
+    consider wv-event-text with snapshot, "source_url"
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding content then set held-source-url to content
+    end consider
+    variable held-source-origin as text is ""
+    consider wv-event-text with snapshot, "source_origin"
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding content then set held-source-origin to content
+    end consider
+    variable held-detail as text is ""
+    consider wv-event-text with snapshot, "detail"
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding content then set held-detail to content
+    end consider
+    when held-window does not equal surface.handle then give Result.Error holding "WebView event belongs to another window" end when
+    variable copied-kind as EventKind is EventKind.Ready
+    consider wv-kind with held-kind
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding content then set copied-kind to content
+    end consider
+    variable copied-value-kind as ValueKind is ValueKind.None
+    consider wv-value-kind with held-value-kind
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding content then set copied-value-kind to content
+    end consider
+    variable copied-source-kind as SourceKind is SourceKind.Unknown
+    consider wv-source-kind with held-source-kind
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding content then set copied-source-kind to content
+    end consider
+    variable copied-frame-kind as FrameKind is FrameKind.Unknown
+    consider wv-frame-kind with held-frame-kind
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding content then set copied-frame-kind to content
+    end consider
+    variable copied-failure-kind as FailureKind is FailureKind.None
+    consider wv-failure-kind with held-failure-kind
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding content then set copied-failure-kind to content
+    end consider
+    variable operation as Option of Operation is Option.None
+    when held-operation is greater than 0 then
+        set operation to Option.Some holding (build nilwebview.Operation with window being surface, id being held-operation)
+    end when
+    give Result.Ok holding (build nilwebview.Event with window being surface, kind being copied-kind,
+        sequence being held-sequence, operation being operation, value-kind being copied-value-kind,
+        payload-json being held-payload-json, source-kind being copied-source-kind,
+        source-url being held-source-url, source-origin being held-source-origin,
+        frame-kind being copied-frame-kind, failure-kind being copied-failure-kind, detail being held-detail)
+end paragraph
+
+!!! Nonblocking. Copies and releases every runtime snapshot, including errors.
+!!! Applications keep polling on the UI thread; do not enter a competing loop.
+public poll-event receives surface as Window returns Result of PendingEvent, text begin paragraph
+    consider wv-poll with surface.handle
+        when Result.Error holding failure then give Result.Error holding failure
+        when Result.Ok holding snapshot then begin block
+            when snapshot equals 0 then give Result.Ok holding Option.None end when
+            value copied is wv-copy-event with snapshot, surface
+            value released is wv-release-event with snapshot
+            consider released
+                when Result.Error holding failure then give Result.Error holding failure
+                when Result.Ok holding status then begin block
+                    when status does not equal 1 then give Result.Error holding "Invalid WebView event release status" end when
+                    consider copied
+                        when Result.Error holding failure then give Result.Error holding failure
+                        when Result.Ok holding notification then give Result.Ok holding (Option.Some holding notification)
+                    end consider
+                end block
+            end consider
+        end block
+    end consider
+end paragraph

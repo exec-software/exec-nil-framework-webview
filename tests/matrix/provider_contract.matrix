@@ -1,0 +1,89 @@
+book nilwebview.tests.provider_contract
+read nilwebview
+read nil.std.core.option
+read nil.std.core.result
+read nil.std.system.std_sys
+read nil.std.testing
+
+expect-error of type T receives outcome as Result of T, text begin paragraph
+    consider outcome
+        when Result.Error holding failure then expect (the length of failure) is greater than 0
+        when Result.Ok holding unexpected then expect no
+    end consider
+end paragraph
+
+next-event receives surface as Window returns Event begin paragraph
+    value pending is require-ok of PendingEvent, text with (poll-event with surface), "poll copied event"
+    give require-some of Event with pending, "expected a synthetic event"
+end paragraph
+
+main returns number begin paragraph
+    expect (nil.std.system::arg_count with nothing) equals 1
+    evaluate expect-error of Capabilities with (configure with "relative-provider")
+    value capabilities is require-ok of Capabilities, text with (configure with (nil.std.system::arg with 0)), "configure fixture"
+    expect not capabilities.sender-url
+    expect not capabilities.sender-origin
+    expect not capabilities.sender-frame
+    evaluate expect-error of Window with (create-window with "invalid", 0, 10)
+    value surface is require-ok of Window, text with (create-window with "Matrix WebView contract λ", 640, 480), "create hidden window"
+    value ready is next-event with surface
+    consider ready.kind
+        when EventKind.Ready then expect yes
+        when _ then expect no
+    end consider
+    expect ready.window.handle equals surface.handle
+    expect ready.sequence is greater than 0
+    consider ready.operation
+        when Option.None then expect yes
+        when _ then expect no
+    end consider
+    value quiet is require-ok of PendingEvent, text with (poll-event with surface), "empty poll"
+    consider quiet
+        when Option.None then expect yes
+        when _ then expect no
+    end consider
+    expect require-ok of boolean, text with (show-window with surface), "show ready window"
+    value navigation is require-ok of Operation, text with (navigate with surface, "about:blank"), "navigate"
+    value loaded is next-event with surface
+    consider loaded.kind
+        when EventKind.NavigationCompleted then expect yes
+        when _ then expect no
+    end consider
+    value completed-navigation is require-some of Operation with loaded.operation, "navigation identity"
+    expect completed-navigation.id equals navigation.id
+    expect completed-navigation.window.handle equals surface.handle
+    expect loaded.payload-json equals (quote plus "about:blank" plus quote)
+    value html-operation is require-ok of Operation, text with (load-html with surface, "<!doctype html><title>Fixture</title>"), "load HTML"
+    value html-loaded is next-event with surface
+    expect (require-some of Operation with html-loaded.operation, "HTML identity").id equals html-operation.id
+    value script-operation is require-ok of Operation, text with (evaluate-function with surface, "return {answer:42};"), "evaluate function"
+    value evaluated is next-event with surface
+    consider evaluated.kind
+        when EventKind.ScriptCompleted then expect yes
+        when _ then expect no
+    end consider
+    consider evaluated.value-kind
+        when ValueKind.Json then expect yes
+        when _ then expect no
+    end consider
+    expect evaluated.payload-json equals ("{" plus quote plus "answer" plus quote plus ":42}")
+    expect (require-some of Operation with evaluated.operation, "script identity").id equals script-operation.id
+    consider evaluated.source-kind
+        when SourceKind.Unknown then expect yes
+        when _ then expect no
+    end consider
+    consider evaluated.frame-kind
+        when FrameKind.Unknown then expect yes
+        when _ then expect no
+    end consider
+    expect evaluated.source-url equals ""
+    expect evaluated.source-origin equals ""
+    expect require-ok of boolean, text with (close-window with surface), "close window"
+    evaluate expect-error of boolean with (close-window with surface)
+    evaluate expect-error of PendingEvent with (poll-event with surface)
+    !!! Copies remain valid after release and window teardown, including on AOT/JIT.
+    expect evaluated.payload-json equals ("{" plus quote plus "answer" plus quote plus ":42}")
+    expect loaded.payload-json equals (quote plus "about:blank" plus quote)
+    say "webview-matrix-contract-ok"
+    give 0
+end paragraph

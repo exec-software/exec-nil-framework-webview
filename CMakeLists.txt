@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+project(nilwebview VERSION 0.1.0 LANGUAGES C CXX)
+include(CTest)
+option(NILWEBVIEW_BUILD_PROVIDER "Build the platform browser provider" ON)
+add_subdirectory(native)

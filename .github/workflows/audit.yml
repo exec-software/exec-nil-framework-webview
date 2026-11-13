@@ -1,0 +1,60 @@
+name: Source security audit
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install checksum-pinned scanner
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/source-scanner"
+          cd "$RUNNER_TEMP/source-scanner"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output scanner.tar.gz
+          printf '%s  scanner.tar.gz\n' 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb | sha256sum --check -
+          tar -xzf scanner.tar.gz gitleaks
+          printf '[extend]\nuseDefault = true\n' > default.toml
+          : > empty.ignore
+      - name: Scan the working tree and the fetched history
+        shell: bash
+        run: |
+          set -euo pipefail
+          flags=(--no-banner --redact=100 --ignore-gitleaks-allow
+                 --config "$RUNNER_TEMP/source-scanner/default.toml"
+                 --gitleaks-ignore-path "$RUNNER_TEMP/source-scanner/empty.ignore"
+                 --max-archive-depth=2 --max-decode-depth=2 --timeout=120)
+          "$RUNNER_TEMP/source-scanner/gitleaks" dir . "${flags[@]}"
+          # Git mode already scans all fetched refs; checkout fetched full history.
+          "$RUNNER_TEMP/source-scanner/gitleaks" git . "${flags[@]}"
+      - name: Verify path-audit detection and safe diagnostics
+        run: python3 -B tests/test_audit_paths.py
+      - name: Verify owned platform-test cleanup controls
+        run: python3 -B tests/test_platform_harness.py
+      - name: Refuse absolute paths, routable addresses and contact details
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Not a secret scan: a home-directory path leaks a name and a
+          # working habit, and no scanner built for API keys will mention it.
+          # Loopback, the unspecified address and the RFC 5737/3849
+          # documentation ranges are allowed, because a server has to name an
+          # address it binds. See scripts/audit-paths.py for the reasoning.
+          python3 -B scripts/audit-paths.py --root .
+      # Scan reports are not uploaded. Even redacted findings can expose
+      # filenames, commit messages and surrounding source context.

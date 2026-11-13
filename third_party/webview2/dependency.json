@@ -1,0 +1,12 @@
+{
+  "package": "Microsoft.Web.WebView2",
+  "version": "1.0.4314.35",
+  "package_bytes": 9818548,
+  "package_sha512_base64": "cOaiVqP3BmQHMnxGpZzANM22tUXgycrisyJHjIGNzIaMsm8iXj7Kx+ceYg+RbYwJtzT009qfcFTocvVLY+ekMw==",
+  "package_sha256": "90778deb1b77e36292828b4b5833c9255c27533f40e0ddd55891ae718944edc4",
+  "package_url": "https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/1.0.4314.35/microsoft.web.webview2.1.0.4314.35.nupkg",
+  "official_hash_metadata": "https://api.nuget.org/v3/catalog0/data/2026.10.23.06.50.10/microsoft.web.webview2.1.0.4314.35.json",
+  "purpose": "Windows build headers and architecture-specific static loader only; browser runtime is separately installed by the user/host.",
+  "license": "Microsoft WebView2 SDK license; see LICENSE.txt; includes upstream NOTICE.txt",
+  "distribution": "SDK headers and binaries are fetched into an explicitly selected build directory; no binary SDK is committed."
+}

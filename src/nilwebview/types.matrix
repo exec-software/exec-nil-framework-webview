@@ -1,0 +1,80 @@
+@pragma once
+book nilwebview
+read nil.std.core.option
+
+!!! Opaque runtime identities, checked against execution context and lifetime.
+public Window begin record
+    field handle as number
+end record
+public Operation begin record
+    field window as Window
+    field id as number
+end record
+
+!!! Capabilities describe native message metadata, not permission to trust pages.
+public Capabilities begin record
+    field sender-url as boolean
+    field sender-origin as boolean
+    field sender-frame as boolean
+end record
+
+public EventKind begin choice
+    when Ready
+    when InitializationFailed
+    when NavigationCompleted
+    when NavigationFailed
+    when ScriptCompleted
+    when ScriptFailed
+    when PageMessage
+    when NavigationRequested
+    when CloseRequested
+    when ProviderFailed
+end choice
+
+public ValueKind begin choice
+    when None
+    when Json
+    when Undefined
+end choice
+
+public SourceKind begin choice
+    when Unknown
+    when NativeURL
+    when NativeOrigin
+end choice
+
+public FrameKind begin choice
+    when Unknown
+    when Main
+    when Child
+end choice
+
+public FailureKind begin choice
+    when None
+    when Native
+    when ScriptException
+    when Serialization
+    when AsyncResult
+    when PayloadLimit
+    when Timeout
+    when Cancelled
+end choice
+
+!!! An immutable copied event. Payload is serialized JSON only for Json;
+!!! Undefined is distinct from JSON null. Empty source fields mean unavailable.
+!!! NativeURL is browser-supplied sender URL, not an authenticated origin.
+public Event begin record
+    field window as Window
+    field kind as EventKind
+    field sequence as number
+    field operation as Option of Operation
+    field value-kind as ValueKind
+    field payload-json as text
+    field source-kind as SourceKind
+    field source-url as text
+    field source-origin as text
+    field frame-kind as FrameKind
+    field failure-kind as FailureKind
+    field detail as text
+end record
+public PendingEvent means nil.std.core.Option of Event

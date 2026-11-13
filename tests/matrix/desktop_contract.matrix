@@ -1,0 +1,347 @@
+book nilwebview.tests.desktop_contract
+read nilwebview
+read nil.std.core.option
+read nil.std.core.result
+read nil.std.system.std_sys
+read nil.std.testing
+
+expect-error of type T receives outcome as Result of T, text begin paragraph
+    consider outcome
+        when Result.Error holding failure then expect (the length of failure) is greater than 0
+        when Result.Ok holding unexpected then expect no
+    end consider
+end paragraph
+
+next-event receives surface as Window, deadline as number returns Event begin paragraph
+    repeat while (now in milliseconds) is less than deadline
+        value pending is require-ok of PendingEvent, text with (poll-event with surface), "poll desktop event"
+        consider pending
+            when Option.Some holding found then give found
+            when Option.None then sleep for 5 milliseconds
+        end consider
+    end repeat
+    evaluate panic with "desktop event deadline expired"
+end paragraph
+
+expect-ready receives surface as Window, deadline as number begin paragraph
+    value ready is next-event with surface, deadline
+    expect ready.window.handle equals surface.handle
+    expect ready.sequence is greater than 0
+    consider ready.kind
+        when EventKind.Ready then expect yes
+        when _ then evaluate panic with ("expected Ready: " plus ready.detail)
+    end consider
+    consider ready.operation
+        when Option.None then expect yes
+        when _ then expect no
+    end consider
+end paragraph
+
+expect-operation receives notification as Event, operation as Operation begin paragraph
+    expect notification.window.handle equals operation.window.handle
+    value completed is require-some of Operation with notification.operation, "operation event identity"
+    expect completed.id equals operation.id
+    expect completed.window.handle equals operation.window.handle
+end paragraph
+
+expect-navigation receives surface as Window, operation as Operation, deadline as number begin paragraph
+    value notification is next-event with surface, deadline
+    evaluate expect-operation with notification, operation
+    consider notification.kind
+        when EventKind.NavigationCompleted then expect yes
+        when _ then evaluate panic with ("navigation failed: " plus notification.detail)
+    end consider
+end paragraph
+
+script-result receives surface as Window, body as text, deadline as number returns Event begin paragraph
+    value operation is require-ok of Operation, text with (evaluate-function with surface, body), "start script"
+    value notification is next-event with surface, deadline
+    evaluate expect-operation with notification, operation
+    give notification
+end paragraph
+
+expect-json receives surface as Window, body as text, expected as text, deadline as number begin paragraph
+    value notification is script-result with surface, body, deadline
+    consider notification.kind
+        when EventKind.ScriptCompleted then expect yes
+        when _ then evaluate panic with ("script failed: " plus notification.detail)
+    end consider
+    consider notification.value-kind
+        when ValueKind.Json then expect yes
+        when _ then expect no
+    end consider
+    expect notification.payload-json equals expected
+end paragraph
+
+expect-script-failure receives surface as Window, body as text, kind as number, deadline as number begin paragraph
+    value notification is script-result with surface, body, deadline
+    consider notification.kind
+        when EventKind.ScriptFailed then expect yes
+        when _ then expect no
+    end consider
+    expect (the length of notification.detail) is greater than 0
+    consider notification.failure-kind
+        when FailureKind.ScriptException then expect kind equals 2
+        when FailureKind.Serialization then expect kind equals 3
+        when FailureKind.AsyncResult then expect kind equals 4
+        when _ then expect no
+    end consider
+end paragraph
+
+message-pair receives surface as Window, body as text, expected-message as text,
+    expected-result as text, deadline as number, label as text returns Event begin paragraph
+    value operation is require-ok of Operation, text with (evaluate-function with surface, body), "start message script"
+    variable message as Option of Event is Option.None
+    variable completion as Option of Event is Option.None
+    variable got-message as boolean is no
+    variable got-completion as boolean is no
+    repeat while not got-message or not got-completion
+        value notification is next-event with surface, deadline
+        expect notification.window.handle equals surface.handle
+        consider notification.kind
+            when EventKind.PageMessage then begin block
+                expect not got-message
+                expect notification.payload-json equals expected-message
+                consider notification.operation
+                    when Option.None then expect yes
+                    when _ then expect no
+                end consider
+                set message to Option.Some holding notification
+                set got-message to yes
+            end block
+            when EventKind.ScriptCompleted then begin block
+                expect not got-completion
+                evaluate expect-operation with notification, operation
+                expect notification.payload-json equals expected-result
+                set completion to Option.Some holding notification
+                set got-completion to yes
+            end block
+            when _ then evaluate panic with ("unexpected paired event: " plus notification.detail)
+        end consider
+    end repeat
+    value received is require-some of Event with message, "message copied"
+    value finished is require-some of Event with completion, "completion copied"
+    expect received.sequence does not equal finished.sequence
+    when received.sequence is less than finished.sequence then
+        say "webview-desktop-order:" plus label plus ":message-first"
+    otherwise
+        say "webview-desktop-order:" plus label plus ":completion-first"
+    end when
+    give received
+end paragraph
+
+expect-provenance receives notification as Event, capabilities as Capabilities, url as text, origin as text begin paragraph
+    consider notification.value-kind
+        when ValueKind.Json then expect yes
+        when _ then expect no
+    end consider
+    when capabilities.sender-url then expect notification.source-url equals url
+    otherwise expect notification.source-url equals "" end when
+    when capabilities.sender-origin then expect notification.source-origin equals origin
+    otherwise expect notification.source-origin equals "" end when
+    when capabilities.sender-origin then
+        consider notification.source-kind
+            when SourceKind.NativeOrigin then expect yes
+            when _ then expect no
+        end consider
+    end when
+    when not capabilities.sender-origin and capabilities.sender-url then
+        consider notification.source-kind
+            when SourceKind.NativeURL then expect yes
+            when _ then expect no
+        end consider
+    end when
+    when not capabilities.sender-origin and not capabilities.sender-url then
+        consider notification.source-kind
+            when SourceKind.Unknown then expect yes
+            when _ then expect no
+        end consider
+    end when
+    when capabilities.sender-frame then
+        consider notification.frame-kind
+            when FrameKind.Main then expect yes
+            when _ then expect no
+        end consider
+    otherwise
+        consider notification.frame-kind
+            when FrameKind.Unknown then expect yes
+            when _ then expect no
+        end consider
+    end when
+end paragraph
+
+mark receives name as text begin paragraph
+    say "webview-desktop-case:" plus name
+end paragraph
+
+main returns number begin paragraph
+    expect (nil.std.system::arg_count with nothing) equals 4
+    value provider is nil.std.system::arg with 0
+    value base is nil.std.system::arg with 1
+    value origin is nil.std.system::arg with 2
+    value host is nil.std.system::arg with 3
+    value deadline is (now in milliseconds) plus 120000
+    evaluate expect-error of Capabilities with (configure with "relative-provider")
+    value capabilities is require-ok of Capabilities, text with (configure with provider), "configure real provider"
+    when host equals "Linux" then
+        expect not capabilities.sender-url
+        expect not capabilities.sender-origin
+        expect not capabilities.sender-frame
+    end when
+    evaluate expect-error of Window with (create-window with "invalid", 0, 10)
+    evaluate mark with "configuration"
+
+    value surface is require-ok of Window, text with (create-window with "NIL WebView desktop λ", 640, 480), "create hidden window"
+    evaluate expect-ready with surface, deadline
+    expect require-ok of boolean, text with (show-window with surface), "show window"
+    evaluate mark with "ready-show"
+
+    value http-operation is require-ok of Operation, text with (navigate with surface, (base plus "/page")), "HTTP navigate"
+    evaluate expect-navigation with surface, http-operation, deadline
+    evaluate expect-json with surface, "return document.getElementById('marker').textContent;", (quote plus "http-ready-λ" plus quote), deadline
+    evaluate mark with "http-document"
+
+    value immediate is message-pair with surface, "window.nilwebview.post({order:'immediate'});return 'sent';",
+        ("{" plus quote plus "order" plus quote plus ":" plus quote plus "immediate" plus quote plus "}"),
+        (quote plus "sent" plus quote), deadline, "immediate"
+    evaluate mark with "message-immediate"
+    value deferred is message-pair with surface, "setTimeout(()=>window.nilwebview.post({order:'deferred'}),75);return 'scheduled';",
+        ("{" plus quote plus "order" plus quote plus ":" plus quote plus "deferred" plus quote plus "}"),
+        (quote plus "scheduled" plus quote), deadline, "deferred"
+    evaluate mark with "message-deferred"
+    evaluate expect-provenance with immediate, capabilities, (base plus "/page"), origin
+    evaluate expect-provenance with deferred, capabilities, (base plus "/page"), origin
+    evaluate mark with "message-provenance"
+
+    value html-operation is require-ok of Operation, text with (load-html with surface,
+        "<!doctype html><meta charset=utf-8><title>Matrix λ</title><div id=marker>embedded λ</div>"), "HTML load"
+    evaluate expect-navigation with surface, html-operation, deadline
+    evaluate expect-json with surface, "return {text:document.getElementById('marker').textContent,answer:42};",
+        ("{" plus quote plus "text" plus quote plus ":" plus quote plus "embedded λ" plus quote plus "," plus quote plus "answer" plus quote plus ":42}"), deadline
+    evaluate expect-json with surface, "return String.fromCharCode(55296);", (quote plus "\ud800" plus quote), deadline
+    variable nested as text is "0"
+    variable depth as number is 0
+    repeat while depth is less than 64
+        set nested to "[" plus nested plus "]"
+        set depth to depth plus 1
+        when depth equals 33 or depth equals 64 then
+            evaluate expect-json with surface, ("return " plus nested plus ";"), nested, deadline
+        end when
+    end repeat
+    evaluate mark with "html-json-unicode-depth"
+
+    value undefined is script-result with surface, "return undefined;", deadline
+    consider undefined.kind
+        when EventKind.ScriptCompleted then expect yes
+        when _ then expect no
+    end consider
+    consider undefined.value-kind
+        when ValueKind.Undefined then expect yes
+        when _ then expect no
+    end consider
+    expect undefined.payload-json equals ""
+    evaluate expect-json with surface, "return null;", "null", deadline
+    !!! The embedded provider cancels dialogs deterministically; no modal UI
+    !!! may block completion or turn a cancelled prompt into an empty string.
+    evaluate expect-json with surface, "alert('owned dialog');return [confirm('owned confirm'),prompt('owned prompt')];", "[false,null]", deadline
+    evaluate mark with "undefined-null"
+    evaluate expect-script-failure with surface, "throw new Error('owned test exception');", 2, deadline
+    evaluate mark with "script-exception"
+    evaluate expect-script-failure with surface, "const cyclic={};cyclic.self=cyclic;return cyclic;", 3, deadline
+    evaluate mark with "script-serialization"
+    evaluate expect-script-failure with surface, "return Promise.resolve(42);", 4, deadline
+    evaluate expect-script-failure with surface, "return {then:function(){}};", 4, deadline
+    evaluate mark with "script-async-result"
+
+    value busy-operation is require-ok of Operation, text with (evaluate-function with surface, "return 7;"), "start busy script"
+    evaluate expect-error of Operation with (evaluate-function with surface, "window.rejectedOperationRan=1;return 8;")
+    evaluate expect-error of Operation with (navigate with surface, (base plus "/page"))
+    value busy-finished is next-event with surface, deadline
+    evaluate expect-operation with busy-finished, busy-operation
+    consider busy-finished.kind
+        when EventKind.ScriptCompleted then expect yes
+        when _ then expect no
+    end consider
+    expect busy-finished.payload-json equals "7"
+    evaluate expect-json with surface, "return typeof window.rejectedOperationRan;", (quote plus "undefined" plus quote), deadline
+    evaluate mark with "operation-busy"
+
+    value redirect-operation is require-ok of Operation, text with (navigate with surface, (base plus "/redirect")), "start redirect"
+    variable requested as boolean is no
+    variable cancelled as boolean is no
+    repeat while not requested or not cancelled
+        value notification is next-event with surface, deadline
+        consider notification.kind
+            when EventKind.NavigationRequested then begin block
+                expect not requested
+                expect notification.payload-json equals (quote plus base plus "/follow" plus quote)
+                consider notification.source-kind
+                    when SourceKind.Unknown then expect yes
+                    when _ then expect no
+                end consider
+                set requested to yes
+            end block
+            when EventKind.NavigationFailed then begin block
+                expect not cancelled
+                evaluate expect-operation with notification, redirect-operation
+                consider notification.failure-kind
+                    when FailureKind.Cancelled then expect yes
+                    when _ then expect no
+                end consider
+                set cancelled to yes
+            end block
+            when _ then evaluate panic with "redirect was followed without explicit authorization"
+        end consider
+    end repeat
+    value follow-operation is require-ok of Operation, text with (navigate with surface, (base plus "/follow")), "explicit redirect follow"
+    evaluate expect-navigation with surface, follow-operation, deadline
+    evaluate expect-json with surface, "return document.title;", (quote plus "explicit-follow" plus quote), deadline
+    evaluate mark with "redirect-explicit-follow"
+
+    value missing-operation is require-ok of Operation, text with (navigate with surface, (base plus "/missing")), "HTTP404 navigate"
+    evaluate expect-navigation with surface, missing-operation, deadline
+    evaluate expect-json with surface, "return document.title;", (quote plus "owned-not-found" plus quote), deadline
+    evaluate mark with "http-error-document"
+
+    value second is require-ok of Window, text with (create-window with "NIL second owned window", 320, 240), "second window"
+    expect second.handle does not equal surface.handle
+    evaluate expect-ready with second, deadline
+    value second-operation is require-ok of Operation, text with (evaluate-function with second, "return 99;"), "second script"
+    value first-quiet is require-ok of PendingEvent, text with (poll-event with surface), "first-window poll"
+    consider first-quiet
+        when Option.None then expect yes
+        when _ then expect no
+    end consider
+    value second-finished is next-event with second, deadline
+    evaluate expect-operation with second-finished, second-operation
+    expect second-finished.payload-json equals "99"
+    expect require-ok of boolean, text with (close-window with second), "close second window"
+    evaluate expect-error of PendingEvent with (poll-event with second)
+    evaluate expect-error of boolean with (show-window with second)
+    evaluate mark with "cross-window-routing"
+
+    value third is require-ok of Window, text with (create-window with "NIL replacement owned window", 320, 240), "replacement window"
+    expect third.handle does not equal second.handle
+    evaluate expect-ready with third, deadline
+    expect require-ok of boolean, text with (close-window with third), "close replacement window"
+    !!! Close immediately after creation without pumping or waiting for Ready.
+    !!! Initialization may finish at any time; stale handles must still fail,
+    !!! and context teardown must drain any outstanding browser/profile work.
+    value fourth is require-ok of Window, text with (create-window with "NIL immediately closed owned window", 320, 240), "create immediately closed window"
+    expect fourth.handle does not equal third.handle
+    expect require-ok of boolean, text with (close-window with fourth), "close without waiting for Ready"
+    evaluate expect-error of boolean with (close-window with fourth)
+    evaluate expect-error of boolean with (show-window with fourth)
+    evaluate expect-error of PendingEvent with (poll-event with fourth)
+    evaluate expect-error of Operation with (evaluate-function with fourth, "return 1;")
+    expect require-ok of boolean, text with (close-window with surface), "close primary window"
+    evaluate expect-error of boolean with (close-window with surface)
+    evaluate expect-error of PendingEvent with (poll-event with surface)
+    value invalid is build nilwebview.Window with handle being -1
+    evaluate expect-error of boolean with (close-window with invalid)
+    expect second-finished.payload-json equals "99"
+    expect immediate.payload-json equals ("{" plus quote plus "order" plus quote plus ":" plus quote plus "immediate" plus quote plus "}")
+    evaluate mark with "close-stale-copied-events"
+    say "webview-desktop-contract-ok"
+    give 0
+end paragraph

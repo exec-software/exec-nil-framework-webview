@@ -1,0 +1,145 @@
+name: WebView platform checks
+
+"on":
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: webview-platform-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NIL_FRAMEWORK_REVISION: e7bc2a00e6854084b7b5084e29fa50456cbe8977
+  PYTHONDONTWRITEBYTECODE: '1'
+  PYTHONUTF8: '1'
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+
+jobs:
+  webview:
+    name: webview-${{ matrix.host.name }}
+    runs-on: ${{ matrix.host.runner }}
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        host:
+          - {name: linux-x86_64, runner: ubuntu-24.04, system: Linux, arch: x86_64, python: python3}
+          - {name: windows-x86_64, runner: windows-2022, system: Windows, arch: x86_64, python: python}
+          - {name: macos-x86_64, runner: macos-15-intel, system: Darwin, arch: x86_64, python: python3}
+          - {name: macos-arm64, runner: macos-15, system: Darwin, arch: arm64, python: python3}
+    defaults:
+      run:
+        shell: bash
+    env:
+      NIL_CI_PYTHON: ${{ matrix.host.python }}
+      NIL_CI_SYSTEM: ${{ matrix.host.system }}
+      NIL_CI_ARCH: ${{ matrix.host.arch }}
+    steps:
+      - name: Check out WebView
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: webview
+          persist-credentials: false
+      - name: Check out pinned public framework
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: exec-software/exec-nil-framework
+          ref: ${{ env.NIL_FRAMEWORK_REVISION }}
+          path: framework
+          persist-credentials: false
+      - name: Select Node.js for actual transport checks
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Install Linux development dependencies
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build llvm-18-dev libgtk-4-dev libwebkitgtk-6.0-dev pkg-config xvfb dbus-x11
+          echo "NIL_CI_LLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm" >> "$GITHUB_ENV"
+      - name: Locate macOS LLVM development package
+        if: runner.os == 'macOS'
+        timeout-minutes: 5
+        run: |
+          nil_llvm_prefix="$(brew --prefix llvm@18)"
+          test -f "$nil_llvm_prefix/lib/cmake/llvm/LLVMConfig.cmake"
+          if ! command -v ninja >/dev/null; then brew install ninja; fi
+          echo "NIL_CI_LLVM_DIR=$nil_llvm_prefix/lib/cmake/llvm" >> "$GITHUB_ENV"
+      - name: Select Windows MSVC x64 development environment
+        if: runner.os == 'Windows'
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $installation) { throw 'Visual Studio x64 Build Tools are required' }
+          & (Join-Path $installation 'Common7/Tools/Launch-VsDevShell.ps1') -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) { throw 'MSVC compiler was not activated' }
+          foreach ($name in @('PATH','INCLUDE','LIB','LIBPATH','VSINSTALLDIR','VCINSTALLDIR','VCToolsInstallDir','VCToolsVersion','WindowsSdkDir','WindowsSDKVersion','UniversalCRTSdkDir','UCRTVersion')) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if ($value) { "$name=$value" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append }
+          }
+          $dia = Join-Path $installation 'DIA SDK/lib/amd64/diaguids.lib'
+          if (-not (Test-Path -LiteralPath $dia -PathType Leaf)) { throw 'Installed VS DIA SDK is required by LLVM' }
+          "NIL_CI_DIA_LIBRARY=$dia" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Fetch pinned Windows development SDKs into temporary storage
+        if: runner.os == 'Windows'
+        timeout-minutes: 26
+        run: |
+          "$NIL_CI_PYTHON" -B webview/scripts/fetch-llvm-windows.py --output "$RUNNER_TEMP/webview-llvm18"
+          "$NIL_CI_PYTHON" -B webview/scripts/fetch-webview2.py --output "$RUNNER_TEMP/webview2-sdk"
+          echo "NIL_CI_LLVM_DIR=$RUNNER_TEMP/webview-llvm18/lib/cmake/llvm" >> "$GITHUB_ENV"
+          echo "NIL_CI_WEBVIEW2_SDK=$RUNNER_TEMP/webview2-sdk" >> "$GITHUB_ENV"
+      - name: Verify source contracts and configure Release builds
+        timeout-minutes: 12
+        run: |
+          nil_optional=()
+          if [ "$RUNNER_OS" = Windows ]; then
+            nil_optional+=(--webview2-sdk "$NIL_CI_WEBVIEW2_SDK" --dia-library "$NIL_CI_DIA_LIBRARY")
+          fi
+          "$NIL_CI_PYTHON" -B webview/scripts/ci-build.py --phase configure \
+            --framework framework --output "$RUNNER_TEMP/webview-ci" --llvm-dir "$NIL_CI_LLVM_DIR" \
+            --expected-system "$NIL_CI_SYSTEM" --expected-machine "$NIL_CI_ARCH" "${nil_optional[@]}"
+      - name: Build checked framework compiler interpreter and fixtures
+        timeout-minutes: 40
+        run: |
+          "$NIL_CI_PYTHON" -B webview/scripts/ci-build.py --phase framework-build \
+            --framework framework --output "$RUNNER_TEMP/webview-ci" \
+            --expected-system "$NIL_CI_SYSTEM" --expected-machine "$NIL_CI_ARCH"
+      - name: Build native browser provider and shared controls
+        timeout-minutes: 8
+        run: |
+          "$NIL_CI_PYTHON" -B webview/scripts/ci-build.py --phase provider-build \
+            --framework framework --output "$RUNNER_TEMP/webview-ci" \
+            --expected-system "$NIL_CI_SYSTEM" --expected-machine "$NIL_CI_ARCH"
+      - name: Verify exact framework and shared contract inventories
+        timeout-minutes: 9
+        run: |
+          "$NIL_CI_PYTHON" -B webview/scripts/ci-build.py --phase contracts \
+            --framework framework --output "$RUNNER_TEMP/webview-ci" \
+            --expected-system "$NIL_CI_SYSTEM" --expected-machine "$NIL_CI_ARCH"
+      - name: Exercise actual desktop and synthetic Matrix consumers on four routes
+        timeout-minutes: 12
+        run: |
+          "$NIL_CI_PYTHON" -B webview/scripts/ci-build.py --phase desktop \
+            --framework framework --output "$RUNNER_TEMP/webview-ci" \
+            --expected-system "$NIL_CI_SYSTEM" --expected-machine "$NIL_CI_ARCH"
+      - name: Upload complete or partial evidence only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: webview-${{ matrix.host.name }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/webview-ci/evidence/
+            ${{ runner.temp }}/webview-ci/platform/evidence/
+            ${{ runner.temp }}/webview-llvm18/nilwebview-llvm.json
+            ${{ runner.temp }}/webview2-sdk/nilwebview-sdk.json
+          if-no-files-found: error
+          retention-days: 14

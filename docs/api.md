@@ -128,7 +128,11 @@ then start a new `navigate` if approved. Do not automatically follow every
 request. This policy is common to all initial providers.
 
 Host fragment navigation within the current document still has an operation
-identity and completion. A page may also change its same-document fragment or
+identity and completion, and preserves that document. Requesting the exact
+current URL including its fragment is idempotent: it completes without
+reloading or dispatching another native navigation. A same-URL request without
+a fragment continues to use ordinary native navigation/reload behavior.
+A page may also change its same-document fragment or
 history URL state without loading a new document. Such URL changes are not a
 cancellable document-load request and do not authorize a later document load.
 The navigation policy is not a lock on the page's exact current URL.

@@ -7,7 +7,7 @@ guarantee. Windows browser qualification remains in progress.
 | Host | Native provider | Native page-message metadata | Current browser evidence |
 | --- | --- | --- | --- |
 | Linux x86-64 | GTK4 + WebKitGTK 6 | None; capabilities are zero, sender fields/frame unknown | Four real browser routes passed ([run](https://github.com/exec-software/exec-nil-framework-webview/actions/runs/43468602639)) |
-| Windows x86-64 | Win32 + WebView2 | Native sender URL and main-frame identity from the top-level message event; origin unavailable | Build and synthetic routes pass; real-browser initialization under investigation |
+| Windows x86-64 | Win32 + WebView2 | Native sender URL and main-frame identity from the top-level message event; origin unavailable | Build, synthetic routes and real initialization/messages pass; fragment qualification in progress |
 | macOS Intel | AppKit + WKWebView | Native frame URL, security origin when available, and frame identity | Four real browser routes passed ([run](https://github.com/exec-software/exec-nil-framework-webview/actions/runs/43468602639)) |
 | macOS Apple Silicon | AppKit + WKWebView | Same API profile as Intel, tested independently | Four real browser routes passed ([run](https://github.com/exec-software/exec-nil-framework-webview/actions/runs/43466470278)) |
 
@@ -40,6 +40,13 @@ AppArmor profile inventory. The Mac runs used system WKWebView on macOS
 before `Ready`; its failure evidence and successful process/profile cleanup
 are retained. The follow-up records the actual WebView2 environment version
 for each initialized window as well as the separately pinned SDK version.
+The [subsequent navigation run](https://github.com/exec-software/exec-nil-framework-webview/actions/runs/43474498040)
+reached real Windows readiness and message delivery on WebView2 131.0.2903.86.
+Its additional fragment regression exposed document reload differences in the
+native engines. The follow-up defines changed-fragment navigation to preserve
+the document and exact repeated fragments to complete idempotently. It requires
+17 browser behavior groups, separate changed/repeated fragment observations,
+preserved JavaScript state and no additional HTTP document request.
 
 ## Dependencies and builds
 

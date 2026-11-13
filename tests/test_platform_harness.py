@@ -24,6 +24,7 @@ class RuntimeEvidenceControls(unittest.TestCase):
         lines = ['webview-desktop-case:' + case for case in DRIVER.DESKTOP_CASES]
         lines += ['webview-desktop-order:immediate:message-first',
                   'webview-desktop-order:deferred:completion-first']
+        lines += ['webview-desktop-fragment:changed', 'webview-desktop-fragment:repeated']
         lines += ['webview-desktop-runtime:' + value for value in runtimes]
         return '\n'.join(lines + ['webview-desktop-contract-ok']) + '\n'
 
@@ -40,6 +41,9 @@ class RuntimeEvidenceControls(unittest.TestCase):
         for system in ('Linux', 'Darwin'):
             report = DRIVER.verify_output(self.output(), 'desktop', system)
             self.assertEqual(report['browser_runtime_versions'], [])
+            self.assertEqual(report['fragment_navigation'], ['changed', 'repeated'])
+            with self.assertRaises(AssertionError):
+                DRIVER.verify_output(self.output().replace('webview-desktop-fragment:changed\n', ''), 'desktop', system)
             with self.assertRaises(AssertionError):
                 DRIVER.verify_output(self.output(['WebView2 142.0.3000.2'] * 3), 'desktop', system)
 

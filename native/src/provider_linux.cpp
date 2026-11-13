@@ -27,6 +27,8 @@ struct LinuxWindow final : Window {
     WebKitWebView *view = nullptr;
     WebKitUserContentManager *manager = nullptr;
     GCancellable *script_cancel = nullptr;
+    GCancellable *fragment_cancel = nullptr;
+    std::int64_t fragment_dispatch_operation = 0;
     std::int64_t script_operation = 0;
     std::int64_t navigation_operation = 0;
     bool initializing = true;
@@ -34,14 +36,24 @@ struct LinuxWindow final : Window {
     bool policy_cancelled = false;
     bool load_started = false;
     bool fragment_navigation = false;
+    bool fragment_dispatch_complete = false;
     bool stopped = false;
     std::string requested_uri;
 
+    void cancel_fragment_dispatch() noexcept {
+        fragment_dispatch_operation = 0;
+        if (fragment_cancel) {
+            g_cancellable_cancel(fragment_cancel);
+            g_object_unref(fragment_cancel);
+            fragment_cancel = nullptr;
+        }
+    }
     void cancel_native() noexcept {
         if (stopped) return;
         stopped = true;
         initial_policy = false;
         fragment_navigation = false;
+        cancel_fragment_dispatch();
         if (script_cancel) g_cancellable_cancel(script_cancel);
         if (view) webkit_web_view_stop_loading(view);
     }
@@ -157,6 +169,7 @@ void load_changed(WebKitWebView *, WebKitLoadEvent event, gpointer data) noexcep
         if (event != WEBKIT_LOAD_FINISHED || !window->load_started) return;
         window->load_started = false;
         window->fragment_navigation = false;
+        window->cancel_fragment_dispatch();
         window->initial_policy = false;
         if (window->initializing) {
             window->initializing = false;
@@ -180,6 +193,7 @@ gboolean load_failed(WebKitWebView *, WebKitLoadEvent, const char *, GError *err
     callback(data, [&](LinuxContext &state, const auto &window) {
         window->load_started = false;
         window->fragment_navigation = false;
+        window->cancel_fragment_dispatch();
         window->initial_policy = false;
         const auto detail = native_detail(error, "WebKit navigation failed");
         if (window->initializing) {
@@ -226,8 +240,16 @@ gboolean decide_policy(WebKitWebView *, WebKitPolicyDecision *decision,
             state.navigation_requested(window, uri);
             if (window->navigation_operation) {
                 window->policy_cancelled = true;
+                const bool fragment = window->fragment_navigation;
                 window->fragment_navigation = false;
                 window->initial_policy = false;
+                if (fragment) {
+                    const auto operation = window->navigation_operation;
+                    window->navigation_operation = 0;
+                    window->cancel_fragment_dispatch();
+                    state.navigation_finished(window, operation, false, {},
+                        "Navigation requires explicit application authorization", NILWV_FAILURE_CANCELLED);
+                }
                 cancel_active_navigation = true;
             }
         }
@@ -296,6 +318,35 @@ struct ScriptCompletion {
     WeakWindow window;
     std::int64_t operation;
 };
+
+void fragment_dispatched(GObject *object, GAsyncResult *result, gpointer data) noexcept {
+    std::unique_ptr<ScriptCompletion> completion(static_cast<ScriptCompletion *>(data));
+    GError *error = nullptr;
+    JSCValue *value = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(object), result, &error);
+    auto window = completion->window.lock();
+    auto state = window ? window->context.lock() : nullptr;
+    if (state && state->owner_thread() && state->live(window)) {
+        if (window->fragment_dispatch_operation == completion->operation) {
+            window->fragment_dispatch_operation = 0;
+            if (window->fragment_cancel) { g_object_unref(window->fragment_cancel); window->fragment_cancel = nullptr; }
+        }
+        try {
+            if (!window->failed && window->fragment_navigation &&
+                window->navigation_operation == completion->operation &&
+                window->operation == completion->operation && window->operation_kind == Operation::navigation) {
+                if (error || !value) {
+                    window->fragment_navigation = false;
+                    window->initial_policy = false;
+                    window->navigation_operation = 0;
+                    state->navigation_finished(window, completion->operation, false, {},
+                        native_detail(error, "WebKit same-document navigation dispatch failed"));
+                } else window->fragment_dispatch_complete = true;
+            }
+        } catch (...) { state->callback_failed(); }
+    }
+    if (value) g_object_unref(value);
+    if (error) g_error_free(error);
+}
 
 void script_completed(GObject *object, GAsyncResult *result, gpointer data) noexcept {
     std::unique_ptr<ScriptCompletion> completion(static_cast<ScriptCompletion *>(data));
@@ -448,15 +499,43 @@ void NILWV_CALL navigate(nilwv_context_v1 *context, std::int64_t id,
             copy_native(webkit_web_view_get_uri(window->view), current_uri) &&
             fragment != std::string::npos &&
             current_uri.compare(0, current_uri.find('#'), uri, 0, fragment) == 0;
+        const bool repeated_fragment = fragment_navigation && current_uri == uri;
+        std::string fragment_script;
+        std::unique_ptr<ScriptCompletion> completion;
+        std::unique_ptr<GCancellable, decltype(&g_object_unref)> cancel(nullptr, g_object_unref);
+        if (fragment_navigation && !repeated_fragment) {
+            fragment_script = "window.location.assign(" + json_string(uri) + "); void 0;";
+            completion = std::make_unique<ScriptCompletion>();
+            completion->window = window;
+            cancel.reset(g_cancellable_new());
+            if (!cancel) { state.fail(out, NILWV_E_NATIVE, "Navigation cancellation state creation failed"); return; }
+        }
         const auto operation = state.start(window, Operation::navigation, out);
         if (!operation) return;
+        if (repeated_fragment) {
+            // Repeating an exact settled fragment URI is an API-level no-op;
+            // engine versions disagree on whether their load API reloads it.
+            state.navigation_finished(window, operation, true, uri);
+            return;
+        }
         window->navigation_operation = operation;
         window->requested_uri = std::move(uri);
         window->initial_policy = true;
         window->policy_cancelled = false;
         window->load_started = false;
         window->fragment_navigation = fragment_navigation;
-        webkit_web_view_load_request(window->view, request);
+        window->fragment_dispatch_complete = false;
+        if (fragment_navigation) {
+            // load_request may replace the document even for a fragment URI.
+            // Location.assign preserves the native document and still passes
+            // through the exact host navigation policy above.
+            completion->operation = operation;
+            window->fragment_dispatch_operation = operation;
+            window->fragment_cancel = cancel.release();
+            webkit_web_view_evaluate_javascript(window->view, fragment_script.c_str(),
+                static_cast<gssize>(fragment_script.size()), nullptr, nullptr, window->fragment_cancel,
+                fragment_dispatched, completion.release());
+        } else webkit_web_view_load_request(window->view, request);
     });
 }
 
@@ -510,14 +589,14 @@ void NILWV_CALL poll(nilwv_context_v1 *context, std::int64_t id, nilwv_result_v1
             if (state.fatal()) break;
         }
         state.expire_operations();
-        // A fragment navigation has no load-changed finish. WebKit reports a
-        // pending API request as loading, including while its URI is still
-        // provisional. Only finish after that loading state has cleared and
-        // the already-authorized fragment target is the native current URI.
+        // A fragment navigation has no load-changed finish. Wait for the native
+        // dispatch callback and exact policy admission as well as a settled
+        // native URI; URI notification alone could describe a provisional URL.
         for (const auto &weak : state.native_windows) {
             auto window = weak.lock();
             if (!window || !state.live(window) || window->failed || window->initializing ||
                 !window->fragment_navigation || window->navigation_operation <= 0 ||
+                !window->fragment_dispatch_complete ||
                 window->operation_kind != Operation::navigation || window->operation != window->navigation_operation ||
                 window->initial_policy || window->policy_cancelled || window->load_started ||
                 webkit_web_view_is_loading(window->view)) continue;

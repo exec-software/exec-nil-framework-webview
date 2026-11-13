@@ -187,7 +187,6 @@ struct WinWindow final : Window {
     bool admit_request = false;
     bool policy_cancelled = false;
     bool fragment_request = false;
-    bool fragment_repeat = false;
 };
 struct WinContext final : Context {
     bool com_initialized = false;
@@ -215,7 +214,6 @@ void dispose(const std::shared_ptr<WinWindow> &value) noexcept {
     value->requested_uri.Reset();
     value->requested_html_uri.clear();
     value->fragment_request = false;
-    value->fragment_repeat = false;
     if (value->handle) { DestroyWindow(value->handle); value->handle = nullptr; }
     if (value->profile) value->profile->retired = true;
     value->profile.reset();
@@ -390,7 +388,7 @@ void finish_fragment(WinContext &state, const std::shared_ptr<WinWindow> &value,
         state.provider_failed(value, "WebView2 fragment URI exceeds text contract"); return;
     }
     const auto operation = value->navigation_operation;
-    value->admit_request = false; value->fragment_request = false; value->fragment_repeat = false;
+    value->admit_request = false; value->fragment_request = false;
     value->navigation_operation = 0;
     state.navigation_finished(value, operation, true, url, "");
 }
@@ -480,7 +478,6 @@ bool attach_handlers(const std::shared_ptr<WinContext> &context, const std::shar
                 if (value->failed || id != value->navigation_id) return;
                 value->admit_request = false; value->navigation_id = 0;
                 value->fragment_request = false;
-                value->fragment_repeat = false;
                 if (value->bootstrap) {
                     value->bootstrap = false;
                     if (okay) state.initialized(value, value->runtime_detail);
@@ -771,18 +768,31 @@ void navigate_common(nilwv_context_v1 *context, std::int64_t id, nilwv_text_v1 i
         }
         auto html_uri = html ? wide(html_navigation_uri(data)) : std::wstring{};
         bool fragment = false, repeat = false;
+        std::string repeated_source;
         if (!html) {
             WideText current;
-            if (SUCCEEDED(value->view->get_Source(&current.value))) fragment = fragment_only(uri.Get(), current.value, repeat);
+            if (SUCCEEDED(value->view->get_Source(&current.value))) {
+                fragment = fragment_only(uri.Get(), current.value, repeat);
+                if (fragment && repeat && !narrow(current.value, repeated_source)) {
+                    state.fail(out, NILWV_E_NATIVE, "WebView2 repeated fragment source exceeds text contract"); return;
+                }
+            }
         }
         const auto operation = state.start(value, Operation::navigation, out); if (!operation) return;
+        // Repeating the already-current fragment is explicitly idempotent.
+        // Older WebView2 versions would reload here, while newer versions do
+        // nothing. Report the observed native Source without queuing a reload
+        // whose delayed Starting event could escape this operation's lifetime.
+        if (fragment && repeat) {
+            state.navigation_finished(value, operation, true, repeated_source, ""); return;
+        }
         value->admit_request = true; value->policy_cancelled = false; value->navigation_id = 0;
         value->requested_uri = uri; value->navigation_operation = operation;
         value->requested_html_uri = std::move(html_uri);
-        value->fragment_request = fragment; value->fragment_repeat = repeat;
+        value->fragment_request = fragment;
         const HRESULT result = html ? value->view->NavigateToString(text.c_str()) : value->view->Navigate(text.c_str());
         if (FAILED(result)) {
-            value->admit_request = false; value->fragment_request = false; value->fragment_repeat = false;
+            value->admit_request = false; value->fragment_request = false;
             value->navigation_operation = 0;
             value->requested_html_uri.clear();
             state.reject(value, operation, out, "WebView2 rejected the navigation");
@@ -835,16 +845,6 @@ void poll(nilwv_context_v1 *context, std::int64_t id, nilwv_result_v1 *out) noex
             if (!PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) break;
             if (message.message == WM_QUIT) { PostQuitMessage(static_cast<int>(message.wParam)); break; }
             TranslateMessage(&message); DispatchMessageW(&message);
-        }
-        // Repeating an already-current fragment has no SourceChanged event.
-        // After pumping the STA, verify the explicitly requested native Source;
-        // this shortcut cannot complete an ordinary same-URL document reload.
-        for (const auto &weak : state.native_windows) if (auto value = weak.lock(); value &&
-            value->fragment_repeat && pending_fragment(value) && value->view) {
-            WideText current;
-            if (FAILED(value->view->get_Source(&current.value)))
-                state.provider_failed(value, "WebView2 repeated fragment source unavailable");
-            else finish_fragment(state, value, current.value);
         }
         state.expire_operations();
         for (const auto &weak : state.native_windows) if (auto value = weak.lock(); value && value->failed) {

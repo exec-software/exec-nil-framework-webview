@@ -47,6 +47,12 @@ end paragraph
 
 expect-operation receives notification as Event, operation as Operation begin paragraph
     expect notification.window.handle equals operation.window.handle
+    consider notification.kind
+        when EventKind.NavigationRequested then evaluate panic with ("expected operation completion; got NavigationRequested: " plus notification.payload-json)
+        when EventKind.ProviderFailed then evaluate panic with ("provider failed during operation: " plus notification.detail)
+        when EventKind.CloseRequested then evaluate panic with "expected operation completion; got CloseRequested"
+        when _ then expect yes
+    end consider
     value completed is require-some of Operation with notification.operation, "operation event identity"
     expect completed.id equals operation.id
     expect completed.window.handle equals operation.window.handle
@@ -227,10 +233,12 @@ main returns number begin paragraph
     evaluate expect-json with surface, "return location.hash;", (quote plus "#section" plus quote), deadline
     evaluate expect-json with surface, "return window.nilwebviewFragmentMarker;", "71", deadline
     evaluate expect-json with surface, "return document.getElementById('marker').textContent;", (quote plus "http-ready-λ" plus quote), deadline
+    say "webview-desktop-fragment:changed"
     value repeated-fragment is require-ok of Operation, text with (navigate with surface, (base plus "/page#section")), "repeat same-document fragment navigation"
     evaluate expect-navigation with surface, repeated-fragment, deadline
     evaluate expect-json with surface, "return location.hash;", (quote plus "#section" plus quote), deadline
     evaluate expect-json with surface, "return window.nilwebviewFragmentMarker;", "71", deadline
+    say "webview-desktop-fragment:repeated"
     evaluate mark with "same-document-navigation"
 
     value html-operation is require-ok of Operation, text with (load-html with surface,

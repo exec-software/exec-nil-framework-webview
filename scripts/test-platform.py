@@ -238,10 +238,13 @@ def verify_output(text: str, profile: str, system: str | None = None) -> dict:
                 for value in runtimes), "actual WebView2 environment versions are missing or malformed")
     else:
         require(not runtimes, "unexpected WebView2 environment version on this host")
-    require(lines[-1:] == ["webview-desktop-contract-ok"] and len(lines) == len(DESKTOP_CASES) + 3 + len(runtimes),
+    fragments = [line.removeprefix("webview-desktop-fragment:") for line in lines
+                 if line.startswith("webview-desktop-fragment:")]
+    require(fragments == ["changed", "repeated"], "same-document navigation observations differ")
+    require(lines[-1:] == ["webview-desktop-contract-ok"] and len(lines) == len(DESKTOP_CASES) + 5 + len(runtimes),
             "desktop route emitted unexpected output or omitted completion")
     return {"checks": len(cases), "cases": cases, "observed_event_order": orders,
-            "browser_runtime_versions": runtimes}
+            "browser_runtime_versions": runtimes, "fragment_navigation": fragments}
 
 
 def route_environment(env: dict[str, str], work: Path, label: str,
